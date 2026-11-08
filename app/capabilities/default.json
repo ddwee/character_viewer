@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "起動失敗時の画面（アプリ内のページ）からだけ、アプリの機能を呼べるようにする",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

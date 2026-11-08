@@ -47,7 +47,9 @@ fn run(samples: &[f32], sr: f32, cfg: &PipelineConfig) -> Outcome {
         } else {
             loud_since = None;
         }
-        let Some(&(_, _, is_speech, key)) = bounds.iter().find(|b| t >= b.0 && t < b.1) else { continue };
+        let Some(&(_, _, is_speech, key)) = bounds.iter().find(|b| t >= b.0 && t < b.1) else {
+            continue;
+        };
         if tr == Some(Transition::SpeechStart) {
             if is_speech {
                 if let Some(s) = loud_since {
@@ -74,20 +76,35 @@ fn run(samples: &[f32], sr: f32, cfg: &PipelineConfig) -> Outcome {
 }
 
 fn main() -> anyhow::Result<()> {
-    let path = std::env::args().nth(1).unwrap_or_else(|| "calibration.wav".into());
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "calibration.wav".into());
     let mut r = hound::WavReader::open(&path)?;
     let spec = r.spec();
     let sr = spec.sample_rate as f32;
-    let samples: Vec<f32> = r.samples::<f32>().step_by(spec.channels as usize).collect::<Result<_, _>>()?;
+    let samples: Vec<f32> = r
+        .samples::<f32>()
+        .step_by(spec.channels as usize)
+        .collect::<Result<_, _>>()?;
 
     // --detail <enter> <confirm> <on_db>: その設定で、雑音区間での発話開始の時刻を表示する
     let args: Vec<String> = std::env::args().collect();
     if args.len() == 6 && args[2] == "--detail" {
-        let (enter, confirm, on_db): (f32, u32, f32) = (args[3].parse()?, args[4].parse()?, args[5].parse()?);
+        let (enter, confirm, on_db): (f32, u32, f32) =
+            (args[3].parse()?, args[4].parse()?, args[5].parse()?);
         let cfg = PipelineConfig {
-            detector: DetectorConfig { on_db, off_db: on_db - 8.0, ..Default::default() },
+            detector: DetectorConfig {
+                on_db,
+                off_db: on_db - 8.0,
+                ..Default::default()
+            },
             hpf_hz: 80.0,
-            voicing: Some(VoicingConfig { enter, exit: enter - 0.15, confirm_hops: confirm, ..Default::default() }),
+            voicing: Some(VoicingConfig {
+                enter,
+                exit: enter - 0.15,
+                confirm_hops: confirm,
+                ..Default::default()
+            }),
         };
         let mut p = Pipeline::new(&cfg, sr);
         let mut start = None;
@@ -98,7 +115,13 @@ fn main() -> anyhow::Result<()> {
                     let s = start.take().unwrap_or(i);
                     let (ts, te) = (s as f32 / sr, i as f32 / sr);
                     let mut acc = 0.0;
-                    let seg = SEGMENTS.iter().find(|g| { acc += g.secs; ts < acc }).map_or("?", |g| g.label);
+                    let seg = SEGMENTS
+                        .iter()
+                        .find(|g| {
+                            acc += g.secs;
+                            ts < acc
+                        })
+                        .map_or("?", |g| g.label);
                     if !matches!(seg, "小声" | "普段の声") {
                         println!("{seg}: {ts:.3}s 〜 {te:.3}s（{:.0}ms）", (te - ts) * 1000.0);
                     }
@@ -114,9 +137,18 @@ fn main() -> anyhow::Result<()> {
         for &confirm in &[3u32, 4, 6] {
             for &on_db in &[-45.0f32, -40.0, -36.0, -32.0] {
                 let cfg = PipelineConfig {
-                    detector: DetectorConfig { on_db, off_db: on_db - 8.0, ..Default::default() },
+                    detector: DetectorConfig {
+                        on_db,
+                        off_db: on_db - 8.0,
+                        ..Default::default()
+                    },
                     hpf_hz: 80.0,
-                    voicing: Some(VoicingConfig { enter, exit: enter - 0.15, confirm_hops: confirm, ..Default::default() }),
+                    voicing: Some(VoicingConfig {
+                        enter,
+                        exit: enter - 0.15,
+                        confirm_hops: confirm,
+                        ..Default::default()
+                    }),
                 };
                 let o = run(&samples, sr, &cfg);
                 println!(

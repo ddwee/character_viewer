@@ -16,7 +16,11 @@ pub struct PipelineConfig {
 
 impl Default for PipelineConfig {
     fn default() -> Self {
-        Self { detector: DetectorConfig::default(), hpf_hz: 80.0, voicing: Some(VoicingConfig::default()) }
+        Self {
+            detector: DetectorConfig::default(),
+            hpf_hz: 80.0,
+            voicing: Some(VoicingConfig::default()),
+        }
     }
 }
 
@@ -89,7 +93,11 @@ mod tests {
         for sr in [48_000.0, 192_000.0] {
             for seed in 1..=3 {
                 let s = starts(&noise(0.2, sr as usize * 5, seed), sr, &cfg);
-                assert!(s.is_empty(), "sr={sr} 息（-14dBFS 相当の雑音）: {} 回反応", s.len());
+                assert!(
+                    s.is_empty(),
+                    "sr={sr} 息（-14dBFS 相当の雑音）: {} 回反応",
+                    s.len()
+                );
             }
             let s = starts(&clicks(0.5, sr as usize * 5, sr), sr, &cfg);
             assert!(s.is_empty(), "sr={sr} タイプ音: {} 回反応", s.len());

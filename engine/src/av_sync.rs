@@ -75,7 +75,10 @@ impl fmt::Display for AvError {
                 f,
                 "録画に測定用の四角（?sync のブラウザソース）が見つかりません。白黒が切り替わる様子が録画に映っているか確認してください"
             ),
-            Self::TooFewChanges(n) => write!(f, "四角が白になった回数が {n} 回しかありません。短く区切って 10 回以上声を出してください"),
+            Self::TooFewChanges(n) => write!(
+                f,
+                "四角が白になった回数が {n} 回しかありません。短く区切って 10 回以上声を出してください"
+            ),
             Self::TooFewMatches(n) => write!(
                 f,
                 "声と絵の切り替えを対応づけられたのが {n} 回だけでした。録画の音声トラックにマイクが入っているか確認してください"
@@ -148,12 +151,27 @@ pub fn picture_rises(video: &VideoFrames) -> Result<(Vec<f64>, usize), AvError> 
     let rises_of = |b: &[u64]| (1..n).filter(|&i| bit(b, i) && !bit(b, i - 1)).count();
     // 何度も白黒を繰り返すセルのうち、互いにほぼ同じタイミングで切り替わる最大の集まりを四角とみなす
     // （背景にたまたま白黒の部分があっても、四角と同じタイミングでは変わらない）
-    let flipping: Vec<usize> = (0..candidates.len()).filter(|&k| rises_of(&bits[k]) >= MIN_EVENTS).collect();
+    let flipping: Vec<usize> = (0..candidates.len())
+        .filter(|&k| rises_of(&bits[k]) >= MIN_EVENTS)
+        .collect();
     let tolerance = (n / 50).max(2) as u32;
-    let agree = |a: usize, b: usize| bits[a].iter().zip(&bits[b]).map(|(x, y)| (x ^ y).count_ones()).sum::<u32>() <= tolerance;
+    let agree = |a: usize, b: usize| {
+        bits[a]
+            .iter()
+            .zip(&bits[b])
+            .map(|(x, y)| (x ^ y).count_ones())
+            .sum::<u32>()
+            <= tolerance
+    };
     let best = flipping
         .iter()
-        .map(|&a| flipping.iter().copied().filter(|&b| agree(a, b)).collect::<Vec<_>>())
+        .map(|&a| {
+            flipping
+                .iter()
+                .copied()
+                .filter(|&b| agree(a, b))
+                .collect::<Vec<_>>()
+        })
         .max_by_key(Vec::len)
         .ok_or(AvError::NoMarker)?;
 
@@ -178,7 +196,10 @@ fn bit(b: &[u64], i: usize) -> bool {
 /// 音声の 1ms ごとのピーク（dBFS）
 fn level_per_ms(samples: &[f32], sr: f32) -> Vec<f32> {
     let block = ((sr / 1000.0).round() as usize).max(1);
-    samples.chunks(block).map(|b| crate::dsp::lin_to_db(b.iter().fold(0.0f32, |m, x| m.max(x.abs())))).collect()
+    samples
+        .chunks(block)
+        .map(|b| crate::dsp::lin_to_db(b.iter().fold(0.0f32, |m, x| m.max(x.abs()))))
+        .collect()
 }
 
 /// 絵の切り替え（`pic` 秒）の前後で、声の立ち上がりを探す。
@@ -219,7 +240,12 @@ fn onset_near(level: &[f32], start: f64, pic: f64) -> Option<(f64, f32)> {
 }
 
 /// 録画の映像・音声から、声と絵の切り替えのずれを測る
-pub fn analyze(video: &VideoFrames, samples: &[f32], sr: f32, audio_start: f64) -> Result<AvReport, AvError> {
+pub fn analyze(
+    video: &VideoFrames,
+    samples: &[f32],
+    sr: f32,
+    audio_start: f64,
+) -> Result<AvReport, AvError> {
     let (rises, marker_cells) = picture_rises(video)?;
     if rises.len() < MIN_EVENTS {
         return Err(AvError::TooFewChanges(rises.len()));
@@ -230,7 +256,10 @@ pub fn analyze(video: &VideoFrames, samples: &[f32], sr: f32, audio_start: f64) 
     let mut snrs = vec![];
     for &pic in &rises {
         if let Some((voice, snr)) = onset_near(&level, audio_start, pic) {
-            events.push(Event { voice_at: voice, picture_at: pic });
+            events.push(Event {
+                voice_at: voice,
+                picture_at: pic,
+            });
             snrs.push(snr);
         }
     }
@@ -240,10 +269,20 @@ pub fn analyze(video: &VideoFrames, samples: &[f32], sr: f32, audio_start: f64) 
     }
 
     let span = video.times.last().unwrap() - video.times[0];
-    let fps = if span > 0.0 { (video.len() - 1) as f64 / span } else { 0.0 };
+    let fps = if span > 0.0 {
+        (video.len() - 1) as f64 / span
+    } else {
+        0.0
+    };
     snrs.sort_by(f32::total_cmp);
     let snr_db = snrs[snrs.len() / 2];
-    Ok(AvReport { fps, marker_cells, snr_db, events, unmatched })
+    Ok(AvReport {
+        fps,
+        marker_cells,
+        snr_db,
+        events,
+        unmatched,
+    })
 }
 
 impl AvReport {
@@ -257,7 +296,11 @@ impl AvReport {
     pub fn median_ms(&self) -> f64 {
         let v = self.sorted_offsets();
         let n = v.len();
-        if n % 2 == 1 { v[n / 2] } else { (v[n / 2 - 1] + v[n / 2]) / 2.0 }
+        if n % 2 == 1 {
+            v[n / 2]
+        } else {
+            (v[n / 2 - 1] + v[n / 2]) / 2.0
+        }
     }
 
     /// 10% 点と 90% 点（ms）
@@ -273,8 +316,17 @@ impl fmt::Display for AvReport {
         let v = self.sorted_offsets();
         let p = |q: f64| v[((v.len() - 1) as f64 * q).round() as usize];
         writeln!(f, "── 声と絵のずれ（録画で実測）──")?;
-        writeln!(f, "映像 {:.1} fps / 測定用の四角 {} セル / 声と雑音の差 {:.0} dB", self.fps, self.marker_cells, self.snr_db)?;
-        writeln!(f, "測定回数 : {} 回（声が見つからなかった切り替え {} 回）", v.len(), self.unmatched)?;
+        writeln!(
+            f,
+            "映像 {:.1} fps / 測定用の四角 {} セル / 声と雑音の差 {:.0} dB",
+            self.fps, self.marker_cells, self.snr_db
+        )?;
+        writeln!(
+            f,
+            "測定回数 : {} 回（声が見つからなかった切り替え {} 回）",
+            v.len(),
+            self.unmatched
+        )?;
         writeln!(
             f,
             "ずれ     : 中央値 {:.1} ms / 最小 {:.1} ms / 最大 {:.1} ms（10〜90% は {:.1}〜{:.1} ms）",
@@ -284,7 +336,11 @@ impl fmt::Display for AvReport {
             p(0.1),
             p(0.9)
         )?;
-        writeln!(f, "         （正の値 = 絵が声より遅れている。映像 1 フレームは {:.1} ms）", 1000.0 / self.fps.max(1.0))?;
+        writeln!(
+            f,
+            "         （正の値 = 絵が声より遅れている。映像 1 フレームは {:.1} ms）",
+            1000.0 / self.fps.max(1.0)
+        )?;
         write!(f, "\n各回 : ")?;
         for e in &self.events {
             write!(f, "{:.0} ", e.offset_ms())?;
@@ -330,12 +386,23 @@ mod tests {
                 *x += 0.2 * (2.0 * std::f64::consts::PI * 150.0 * t).sin() as f32;
             }
         }
-        (VideoFrames { width: w, height: h, times, luma }, audio, sr)
+        (
+            VideoFrames {
+                width: w,
+                height: h,
+                times,
+                luma,
+            },
+            audio,
+            sr,
+        )
     }
 
     #[test]
     fn measures_known_delay_within_one_frame() {
-        let voice: Vec<f64> = (0..12).map(|i| 1.0 + i as f64 * 1.3 + (i % 3) as f64 * 0.11).collect();
+        let voice: Vec<f64> = (0..12)
+            .map(|i| 1.0 + i as f64 * 1.3 + (i % 3) as f64 * 0.11)
+            .collect();
         for delay in [0.030, 0.045, 0.080] {
             let (video, audio, sr) = synth(&voice, delay, 60.0, 18.0);
             let r = analyze(&video, &audio, sr, 0.0).unwrap();
@@ -343,8 +410,15 @@ mod tests {
             assert_eq!(r.marker_cells, 12);
             // フレーム単位に丸められるので、誤差は 1 フレーム（16.7ms）未満
             let m = r.median_ms();
-            assert!((m - delay * 1000.0).abs() < 1000.0 / 60.0, "delay {delay}: median {m}");
-            assert!(r.sorted_offsets().iter().all(|&o| o >= delay * 1000.0 - 1.0 && o < delay * 1000.0 + 17.0));
+            assert!(
+                (m - delay * 1000.0).abs() < 1000.0 / 60.0,
+                "delay {delay}: median {m}"
+            );
+            assert!(
+                r.sorted_offsets()
+                    .iter()
+                    .all(|&o| o >= delay * 1000.0 - 1.0 && o < delay * 1000.0 + 17.0)
+            );
         }
     }
 
@@ -354,13 +428,20 @@ mod tests {
         let (video, audio, sr) = synth(&voice, 0.05, 60.0, 14.0);
         // 音声が映像より 0.1 秒遅く始まっていたら（＝音声の時刻は +0.1 されている）、ずれは 0.1 秒減る
         let r = analyze(&video, &audio, sr, 0.1).unwrap();
-        assert!((r.median_ms() - (50.0 - 100.0)).abs() < 17.0, "median {}", r.median_ms());
+        assert!(
+            (r.median_ms() - (50.0 - 100.0)).abs() < 17.0,
+            "median {}",
+            r.median_ms()
+        );
     }
 
     #[test]
     fn no_marker_is_reported() {
         let (mut video, audio, sr) = synth(&[1.0, 2.0], 0.05, 60.0, 4.0);
         video.luma.iter_mut().for_each(|v| *v = 100);
-        assert_eq!(analyze(&video, &audio, sr, 0.0).err(), Some(AvError::NoMarker));
+        assert_eq!(
+            analyze(&video, &audio, sr, 0.0).err(),
+            Some(AvError::NoMarker)
+        );
     }
 }

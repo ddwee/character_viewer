@@ -23,7 +23,13 @@ pub struct DetectorConfig {
 
 impl Default for DetectorConfig {
     fn default() -> Self {
-        Self { on_db: -42.0, off_db: -50.0, hold_ms: 250.0, attack_ms: 1.0, release_ms: 40.0 }
+        Self {
+            on_db: -42.0,
+            off_db: -50.0,
+            hold_ms: 250.0,
+            attack_ms: 1.0,
+            release_ms: 40.0,
+        }
     }
 }
 
@@ -55,7 +61,10 @@ fn one_pole_coef(time_ms: f32, sample_rate: f32) -> f32 {
 
 impl Detector {
     pub fn new(cfg: DetectorConfig, sample_rate: f32) -> Self {
-        assert!(cfg.off_db <= cfg.on_db, "off_db は on_db 以下にしてください");
+        assert!(
+            cfg.off_db <= cfg.on_db,
+            "off_db は on_db 以下にしてください"
+        );
         Self {
             on_lin: db_to_lin(cfg.on_db),
             off_lin: db_to_lin(cfg.off_db),
@@ -71,7 +80,11 @@ impl Detector {
     /// `level` は整流済み（>= 0）の振幅、`voiced` は有声判定の結果。
     #[inline]
     pub fn process(&mut self, level: f32, voiced: bool) -> Option<Transition> {
-        let coef = if level > self.env { self.attack_coef } else { self.release_coef };
+        let coef = if level > self.env {
+            self.attack_coef
+        } else {
+            self.release_coef
+        };
         self.env = coef * self.env + (1.0 - coef) * level;
 
         if !self.speaking {
@@ -108,7 +121,13 @@ mod tests {
     const SR: f32 = 48_000.0;
 
     /// 振幅 amp の 200Hz 正弦波を n サンプル流し、遷移とその位置を集める
-    fn feed(det: &mut Detector, amp: f32, n: usize, offset: usize, out: &mut Vec<(usize, Transition)>) {
+    fn feed(
+        det: &mut Detector,
+        amp: f32,
+        n: usize,
+        offset: usize,
+        out: &mut Vec<(usize, Transition)>,
+    ) {
         for i in 0..n {
             let t = (offset + i) as f32 / SR;
             let x = amp * (2.0 * std::f32::consts::PI * 200.0 * t).sin();
@@ -159,7 +178,10 @@ mod tests {
         let (pos, tr) = ev[1];
         assert_eq!(tr, Transition::SpeechEnd);
         let ms = (pos - silence_start) as f32 / SR * 1000.0;
-        assert!(ms >= cfg.hold_ms && ms < cfg.hold_ms + 300.0, "終了は hold 経過後: {ms}ms");
+        assert!(
+            ms >= cfg.hold_ms && ms < cfg.hold_ms + 300.0,
+            "終了は hold 経過後: {ms}ms"
+        );
     }
 
     #[test]
@@ -184,7 +206,11 @@ mod voicing_gate_tests {
     fn unvoiced_never_starts_and_does_not_extend() {
         let mut det = Detector::new(DetectorConfig::default(), 48_000.0);
         for _ in 0..48_000 {
-            assert_eq!(det.process(0.3, false), None, "大きくても無声なら開始しない");
+            assert_eq!(
+                det.process(0.3, false),
+                None,
+                "大きくても無声なら開始しない"
+            );
         }
         assert_eq!(det.process(0.3, true), Some(Transition::SpeechStart));
         // 話し終わった後に大きな無声音（タイプ音）が続いても、hold 経過で終了する

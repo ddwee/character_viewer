@@ -24,7 +24,13 @@ pub struct VoicingConfig {
 
 impl Default for VoicingConfig {
     fn default() -> Self {
-        Self { enter: 0.6, exit: 0.45, f0_min: 70.0, f0_max: 600.0, confirm_hops: 3 }
+        Self {
+            enter: 0.6,
+            exit: 0.45,
+            f0_min: 70.0,
+            f0_max: 600.0,
+            confirm_hops: 3,
+        }
     }
 }
 
@@ -63,7 +69,10 @@ impl Voicing {
         let n = window + tau_max;
         let fc = LPF_HZ.min(rate * 0.4);
         // 2 段で 4 次バターワース
-        let lp = [Biquad::lowpass(fc, sample_rate, 0.5412), Biquad::lowpass(fc, sample_rate, 1.3066)];
+        let lp = [
+            Biquad::lowpass(fc, sample_rate, 0.5412),
+            Biquad::lowpass(fc, sample_rate, 1.3066),
+        ];
         Self {
             cfg,
             lp,
@@ -199,7 +208,8 @@ pub(crate) mod tests {
             .map(|i| {
                 let t = (i % period) as f32 / sr;
                 let decay = (-t / 0.003).exp();
-                amp * decay * (0.6 * rnd[i] + 0.4 * (2.0 * std::f32::consts::PI * 3_000.0 * t).sin())
+                amp * decay
+                    * (0.6 * rnd[i] + 0.4 * (2.0 * std::f32::consts::PI * 3_000.0 * t).sin())
             })
             .collect()
     }
