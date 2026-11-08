@@ -1,0 +1,14 @@
+{
+  "states": {
+    "idle": {
+      "image": "placeholder/idle.svg",
+      "blink": { "half": "placeholder/idle_half.svg", "closed": "placeholder/idle_closed.svg" }
+    },
+    "talk": {
+      "image": "placeholder/talk.svg",
+      "blink": { "half": "placeholder/talk_half.svg", "closed": "placeholder/talk_closed.svg" }
+    },
+    "away": "placeholder/away.svg",
+    "sleep": "placeholder/sleep.svg"
+  }
+}
