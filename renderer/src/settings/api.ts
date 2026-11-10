@@ -111,6 +111,8 @@ export interface AvatarView {
   dir: string;
   exists: boolean;
   states: { state: AvatarState; label: string; slots: SlotView[] }[];
+  /** avatar.json に rig（パーツを重ねてボーンで動かす設定）がある */
+  rig: boolean;
   error: string | null;
 }
 

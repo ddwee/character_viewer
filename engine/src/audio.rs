@@ -207,6 +207,11 @@ impl Sink for Processor {
             voiced: self.pipeline.is_voiced(),
             frames: frames as u32,
         });
+        // 喋っている間は音量もすぐ届ける（口の開き具合に使う）。
+        // 起こさないと Windows のスリープの細かさ（約 15.6ms）ごとにしか送れない
+        if self.pipeline.is_speaking() {
+            self.control.unpark();
+        }
     }
 }
 

@@ -1,11 +1,13 @@
 // 描画ページ（OBS のブラウザソースで開く）。
-// エンジンから WebSocket で届いた状態に合わせて透過画像を切り替え、まばたきもさせる。
+// エンジンから WebSocket で届いた状態に合わせて絵を変える。表示のしかたは素材によって 2 通り:
 //
-// 絵が変わるときだけ描く（毎フレームは描き直さない）。OBS の負荷が軽く、
-// 描き直しのタイミングによるちらつきも起きにくい。
+// - 1 枚絵: 状態ごとの透過画像を切り替え、まばたきもさせる。
+//   絵が変わるときだけ描く（毎フレームは描き直さない）。OBS の負荷が軽く、ちらつきも起きにくい
+// - パーツ（avatar.json に rig があるとき）: パーツを重ね、ボーンで動かす（呼吸・頭の揺れ・髪の揺れ・口パク・まばたき）。
+//   動き続けるので毎フレーム描く。口の開き具合はエンジンから約 100 回/秒で届く音量で決める
 //
 // URL のオプション
-//   ?debug    状態・接続・音量を左上に表示。キー 1〜4 で状態を手動で切り替え、B でまばたき
+//   ?debug    状態・接続・音量を左上に表示。キー 1〜4 で状態を手動で切り替え（発話は声のまね付き）、B でまばたき
 //   ?checker  背景を市松模様にする（ブラウザで透過を確認する用）
 //   ?sync     遅延測定用。発話中は白、それ以外は黒で全体を塗る（cv-engine --measure-av で解析する）
 //   ?engine=127.0.0.1:39540  エンジンの場所（通常は不要）
@@ -15,6 +17,10 @@ import { Application, Assets, Sprite, Texture } from 'pixi.js';
 import 'pixi.js/prepare';
 
 import { BlinkScheduler, type Eye } from './blink';
+import { parseRig, rigImages, type Rig } from './rig/manifest';
+import { Animator } from './rig/motion';
+import { MouthController, type Mouth } from './rig/mouth';
+import { RigView } from './rig/view';
 
 type AvatarState = 'idle' | 'talk' | 'away' | 'sleep';
 
@@ -33,7 +39,9 @@ type StateEntry =
     };
 
 interface Manifest {
-  states: Partial<Record<AvatarState, StateEntry>>;
+  states?: Partial<Record<AvatarState, StateEntry>>;
+  /** パーツを重ねてボーンで動かす設定（あれば states は使わない） */
+  rig?: unknown;
 }
 
 /** 1 状態ぶんの絵 */
@@ -41,6 +49,14 @@ interface Look {
   open: Texture;
   half?: Texture;
   closed?: Texture;
+}
+
+/** パーツで動かす素材 */
+interface RigAvatar {
+  rig: Rig;
+  view: RigView;
+  animator: Animator;
+  textures: Texture[];
 }
 
 /** 見た目の設定（設定画面で変える） */
@@ -55,7 +71,8 @@ type ServerMsg =
   | { type: 'state'; state: AvatarState; seq: number }
   | ({ type: 'config' } & DisplayConfig)
   | { type: 'reload' }
-  | { type: 'meter'; db: number; voicing: number; voiced: boolean };
+  | { type: 'meter'; db: number; voicing: number; voiced: boolean }
+  | { type: 'level'; db: number };
 
 const PROTOCOL_VERSION = 1;
 const RECONNECT_MS = 1000;
@@ -73,6 +90,14 @@ const sprite = new Sprite();
 const looks = new Map<AvatarState, Look>();
 const blink = new BlinkScheduler(Math.random, performance.now());
 const EMPTY_LOOK: Look = { open: Texture.EMPTY };
+const mouth = new MouthController();
+/** パーツで動かす素材（1 枚絵のときは null） */
+let rigAvatar: RigAvatar | null = null;
+/** 前のフレームの時刻（パーツの動き用） */
+let lastFrameAt: number | null = null;
+/** 発話をプレビュー・デバッグで試しているとき、声のまねをする（エンジンの音量の代わり） */
+let simulateVoice = false;
+let mouthShape: Mouth = 'closed';
 
 let current: AvatarState = 'idle';
 let config: DisplayConfig = { blink: true, blinkRate: 1, mirror: false };
@@ -91,9 +116,22 @@ function lookFor(state: AvatarState): Look {
   return EMPTY_LOOK;
 }
 
+/** パーツが動いてはみ出さないよう、上と左右に空けておく割合 */
+const RIG_MARGIN = 0.03;
+
 /** 画面に収まる最大サイズで、下端中央に置く */
 function layout(): void {
   if (syncMode) return drawSync();
+  if (rigAvatar) {
+    const [w, h] = rigAvatar.view.size;
+    const root = rigAvatar.view.root;
+    const { width, height } = app.screen;
+    const scale = Math.min(width / (w * (1 + 2 * RIG_MARGIN)), height / (h * (1 + RIG_MARGIN)));
+    root.pivot.set(w / 2, h);
+    root.scale.set(config.mirror ? -scale : scale, scale);
+    root.position.set(width / 2, height);
+    return;
+  }
   const tex = sprite.texture;
   if (tex.width === 0 || tex.height === 0) return;
   const { width, height } = app.screen;
@@ -136,10 +174,39 @@ function drawAvatar(now: number, look: Look): void {
   }
 }
 
+/** 声のまね（1 秒に 5 回ほど口が開閉する音量） */
+function fakeLevel(now: number): number {
+  const t = now / 1000;
+  return -18 - 24 * (1 - Math.abs(Math.sin(Math.PI * 2.6 * t)) * (0.75 + 0.25 * Math.sin(t * 1.7)));
+}
+
+/** その状態でまばたきするか */
+function blinksIn(state: AvatarState): boolean {
+  if (!config.blink) return false;
+  if (rigAvatar) return rigAvatar.view.canBlink && !rigAvatar.animator.eyesFor(state);
+  return !!lookFor(state).closed;
+}
+
+function drawRig(now: number, av: RigAvatar): void {
+  const dt = lastFrameAt === null ? 0 : (now - lastFrameAt) / 1000;
+  lastFrameAt = now;
+
+  if (simulateVoice && current === 'talk') mouth.level(fakeLevel(now), now);
+  mouthShape = mouth.update(now);
+
+  const prevEye = eye;
+  eye = av.animator.eyesFor(current) ?? (blinksIn(current) ? blink.update(now, av.view.hasHalfEyes) : 'open');
+  if (prevEye === 'open' && eye !== 'open') stats.blinks++;
+
+  av.animator.update({ t: now / 1000, dt, state: current, mouth: current === 'talk' ? mouth.amount : 0 });
+  av.view.update(av.animator.skeleton, mouthShape, eye);
+}
+
 function frame(now: number): void {
   frameRequested = false;
   const look = lookFor(current);
   if (syncMode) drawSync();
+  else if (rigAvatar) drawRig(now, rigAvatar);
   else drawAvatar(now, look);
   app.render();
   stats.renders++;
@@ -148,8 +215,14 @@ function frame(now: number): void {
   for (const seq of pendingAcks) sendAck(seq);
   pendingAcks = [];
 
-  // 次に描くべき時刻まで眠る（まばたき中は毎フレーム描く）
+  // パーツで動かすときは毎フレーム描く
   clearTimeout(wakeTimer);
+  if (!syncMode && rigAvatar) {
+    requestFrame();
+    return;
+  }
+  lastFrameAt = null;
+  // 次に描くべき時刻まで眠る（まばたき中は毎フレーム描く）
   if (!syncMode && look.closed && config.blink) {
     const wakeAt = blink.wakeAt();
     if (wakeAt <= now) requestFrame();
@@ -157,15 +230,18 @@ function frame(now: number): void {
   }
 }
 
-function show(state: AvatarState): void {
+/** 状態を変える。`simulated` はプレビュー・デバッグで試すとき（発話なら声のまねをする） */
+function show(state: AvatarState, simulated = false): void {
+  simulateVoice = simulated;
   const prev = current;
   if (prev === state) return;
   current = state;
 
   const now = performance.now();
   blink.setTalking(state === 'talk');
+  mouth.setTalking(state === 'talk', now);
   // まばたきできない絵（寝落ちなど）から戻ったら、予定を立て直す
-  if (!lookFor(prev).closed && lookFor(state).closed) blink.reschedule(now);
+  if (!blinksIn(prev) && blinksIn(state)) blink.reschedule(now);
   // 話し終わり・目覚めは、まばたきが起きやすい区切り
   if ((prev === 'talk' && state === 'idle') || ((prev === 'away' || prev === 'sleep') && state === 'talk')) {
     blink.cue(now);
@@ -196,11 +272,53 @@ async function loadLook(entry: StateEntry): Promise<Look> {
  * 素材を読み込む。読み込み直しのときは、新しい絵がすべて揃ってから入れ替える
  * （途中で失敗したら今の絵のまま）
  */
+/** パーツの素材を読み込む（GPU へ送るところまで） */
+async function loadRig(raw: unknown): Promise<RigAvatar> {
+  const rig = parseRig(raw);
+  const files = rigImages(rig);
+  const loaded = await Promise.all(files.map(loadTexture));
+  await app.renderer.prepare.upload(loaded);
+  const textures = new Map(files.map((f, i) => [f, loaded[i]]));
+  return { rig, view: new RigView(rig, textures), animator: new Animator(rig), textures: loaded };
+}
+
+/** 入れ替える前の絵を、描き替えたあとで GPU とキャッシュから外す */
+function retireOld(oldLooks: Texture[], oldRig: RigAvatar | null): void {
+  requestAnimationFrame(() => {
+    const keep = new Set([...looks.values()].flatMap((l) => [l.open, l.half, l.closed]));
+    for (const t of oldLooks) if (!keep.has(t)) t.destroy(true);
+    if (oldRig) {
+      oldRig.view.destroy();
+      for (const t of oldRig.textures) t.destroy(true);
+    }
+  });
+}
+
 async function loadAvatar(): Promise<void> {
   avatarVersion++;
   const res = await fetch(`avatar/avatar.json?v=${avatarVersion}`, { cache: 'no-store' });
   if (!res.ok) throw new Error(`avatar/avatar.json を読み込めません（${res.status}）`);
   const manifest = (await res.json()) as Manifest;
+
+  const textures = (m: Map<AvatarState, Look>) => [...m.values()].flatMap((l) => [l.open, l.half, l.closed]).filter((t): t is Texture => !!t);
+
+  if (manifest.rig !== undefined) {
+    const next = await loadRig(manifest.rig);
+    const oldLooks = textures(looks);
+    const oldRig = rigAvatar;
+    looks.clear();
+    oldRig?.view.root.removeFromParent();
+    sprite.visible = false;
+    rigAvatar = next;
+    app.stage.addChild(next.view.root);
+    lastFrameAt = null;
+    layout();
+    overlay.clearError();
+    subscribe();
+    requestFrame();
+    retireOld(oldLooks, oldRig);
+    return;
+  }
 
   const next = new Map<AvatarState, Look>();
   await Promise.all(
@@ -212,19 +330,20 @@ async function loadAvatar(): Promise<void> {
   if (!next.has('idle')) throw new Error('待機の絵が設定されていません（設定画面の「画像」で設定してください）');
 
   // 切り替えた瞬間にカクつかないよう、全画像を先に GPU へ送っておく
-  const textures = (m: Map<AvatarState, Look>) => [...m.values()].flatMap((l) => [l.open, l.half, l.closed]).filter((t): t is Texture => !!t);
   await app.renderer.prepare.upload(textures(next));
 
   const old = textures(looks);
+  const oldRig = rigAvatar;
+  oldRig?.view.root.removeFromParent();
+  rigAvatar = null;
+  sprite.visible = true;
   looks.clear();
   for (const [k, v] of next) looks.set(k, v);
   sprite.texture = Texture.EMPTY;
   overlay.clearError();
+  subscribe();
   requestFrame();
-  // 古い絵を GPU とキャッシュから外す（描き替えたあとで）
-  requestAnimationFrame(() => {
-    for (const t of old) if (!textures(looks).includes(t)) t.destroy(true);
-  });
+  retireOld(old, oldRig);
 }
 
 let reloading: Promise<void> | null = null;
@@ -256,6 +375,8 @@ function engineUrl(): string {
 }
 
 let disconnectTimer: ReturnType<typeof setTimeout> | undefined;
+/** 音量の購読を送り直す（素材がパーツかどうかで、口用の音量が要るかが変わる） */
+let subscribe: () => void = () => {};
 
 function connect(): void {
   const ws = new WebSocket(engineUrl());
@@ -265,7 +386,8 @@ function connect(): void {
     clearTimeout(disconnectTimer);
     if (!embed) sendAck = (seq) => send({ type: 'ack', seq });
     overlay.connected(true);
-    if (debug) send({ type: 'subscribe', meter: true });
+    subscribe = () => send({ type: 'subscribe', meter: debug, level: rigAvatar !== null });
+    if (debug || rigAvatar) subscribe();
   };
 
   ws.onmessage = (ev: MessageEvent<string>) => {
@@ -288,6 +410,7 @@ function connect(): void {
         blink.setRate(config.blinkRate);
         blink.reschedule(performance.now());
         sprite.texture = Texture.EMPTY; // 反転などを反映させるため配置し直す
+        if (rigAvatar) layout();
         requestFrame();
         break;
       }
@@ -297,10 +420,14 @@ function connect(): void {
       case 'meter':
         overlay.meter(msg.db, msg.voicing, msg.voiced);
         break;
+      case 'level':
+        if (!simulateVoice) mouth.level(msg.db, performance.now());
+        break;
     }
   };
 
   ws.onclose = () => {
+    subscribe = () => {};
     overlay.connected(false);
     // 短い切断ではそのまま。続くようなら喋りっぱなしにならないよう待機に戻す
     clearTimeout(disconnectTimer);
@@ -324,10 +451,10 @@ const overlay = (() => {
     if (!debug) return;
     el.textContent = [
       `接続 : ${conn ? '○ エンジンと接続中' : '× 未接続（再接続を試行中）'}`,
-      `状態 : ${LABELS[current]}（${current}）`,
+      `状態 : ${LABELS[current]}（${current}）${rigAvatar ? `  口 ${mouthShape} / 目 ${eye}` : ''}`,
       level,
       `回数 : 切替 ${stats.changes} / 再接続 ${stats.reconnects} / まばたき ${stats.blinks} / 描画 ${stats.renders}`,
-      'キー 1〜4 で状態を切り替え、B でまばたき',
+      'キー 1〜4 で状態を切り替え（発話は声のまね付き）、B でまばたき',
     ]
       .filter(Boolean)
       .join('\n');
@@ -337,7 +464,7 @@ const overlay = (() => {
     el.hidden = false;
     window.addEventListener('keydown', (e) => {
       const state = STATES[Number(e.key) - 1];
-      if (state) show(state);
+      if (state) show(state, true);
       if (e.key === 'b' || e.key === 'B') {
         blink.blinkNow(performance.now());
         requestFrame();
@@ -412,7 +539,7 @@ async function main(): Promise<void> {
     window.addEventListener('message', (e: MessageEvent) => {
       if (e.origin !== location.origin) return;
       const m = e.data as { type?: string; state?: AvatarState };
-      if (m.type === 'preview-state' && m.state && STATES.includes(m.state)) show(m.state);
+      if (m.type === 'preview-state' && m.state && STATES.includes(m.state)) show(m.state, true);
       if (m.type === 'preview-blink') {
         blink.blinkNow(performance.now());
         requestFrame();

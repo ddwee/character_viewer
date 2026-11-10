@@ -103,6 +103,8 @@ pub struct AvatarView {
     pub dir: PathBuf,
     pub exists: bool,
     pub states: Vec<StateView>,
+    /// avatar.json に `rig`（パーツを重ねてボーンで動かす設定）がある。あれば状態ごとの絵は使わない
+    pub rig: bool,
     pub error: Option<String>,
 }
 
@@ -161,6 +163,7 @@ pub fn view(dir: &Path) -> AvatarView {
         dir: dir.to_path_buf(),
         exists: dir.is_dir(),
         states,
+        rig: m.other.get("rig").is_some_and(Value::is_object),
         error,
     }
 }
@@ -333,9 +336,26 @@ mod tests {
         let v: Value =
             serde_json::from_str(&std::fs::read_to_string(d.join("avatar.json")).unwrap()).unwrap();
         assert_eq!(v["future"], true);
+        assert!(!view(&d).rig);
         assert_eq!(v["states"]["talk"]["layer"], 3);
         assert_eq!(v["states"]["talk"]["blink"]["closed"], "talk_closed.png");
         assert!(set_slot(&d, "talk", "image", "evil.exe", b"x").is_err());
         assert!(set_slot(&d, "../x", "image", "a.png", b"x").is_err());
+    }
+
+    #[test]
+    fn detects_rig_and_keeps_it_when_slots_change() {
+        let d = tmp("rig");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("avatar.json"),
+            r#"{"rig":{"layers":[{"bone":"head","image":"parts/face.png"}]}}"#,
+        )
+        .unwrap();
+        assert!(view(&d).rig);
+        set_slot(&d, "idle", "image", "a.png", b"x").unwrap();
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(d.join("avatar.json")).unwrap()).unwrap();
+        assert_eq!(v["rig"]["layers"][0]["image"], "parts/face.png");
     }
 }

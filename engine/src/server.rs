@@ -15,10 +15,11 @@
 //! - `{"type":"config","blink":true,"blinkRate":1,"mirror":false}`  見た目の設定。接続直後と変更時
 //! - `{"type":"reload"}`                                    イラスト素材が変わったので読み込み直す
 //! - `{"type":"meter","db":-41.2,"voicing":0.93,"voiced":true}`  音量など（subscribe した側だけ、約 30 回/秒）
+//! - `{"type":"level","db":-31.5}`                          音量だけ（subscribe した側だけ、音声の処理単位ごと＝約 100 回/秒）。口の開き具合用
 //!
 //! 表示側 → エンジン
 //! - `{"type":"ack","seq":12}`             その状態を描画したフレームで返す（遅延の測定用）
-//! - `{"type":"subscribe","meter":true}`   音量などを受け取る
+//! - `{"type":"subscribe","meter":true,"level":true}`   音量などを受け取る（`level` は省略可）
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -78,19 +79,29 @@ enum Outgoing {
     Config(DisplaySettings),
     Reload,
     Meter(MeterMsg),
+    Level { db: f32 },
 }
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum Incoming {
-    Ack { seq: u64 },
-    Subscribe { meter: bool },
+    Ack {
+        seq: u64,
+    },
+    Subscribe {
+        #[serde(default)]
+        meter: bool,
+        #[serde(default)]
+        level: bool,
+    },
 }
 
 /// 制御スレッド・設定 API とサーバーの橋渡し
 pub struct Hub {
     state: watch::Sender<StateMsg>,
     meter: watch::Sender<MeterMsg>,
+    /// 音量エンベロープ（dB）。音声の処理単位ごとに更新する
+    level: watch::Sender<f32>,
     config: watch::Sender<DisplaySettings>,
     reload: watch::Sender<u64>,
     seq: AtomicU64,
@@ -112,6 +123,7 @@ impl Hub {
                 seq: 0,
             }),
             meter: watch::Sender::new(MeterMsg::default()),
+            level: watch::Sender::new(-120.0),
             config: watch::Sender::new(display),
             reload: watch::Sender::new(0),
             seq: AtomicU64::new(0),
@@ -135,6 +147,11 @@ impl Hub {
 
     pub fn publish_meter(&self, meter: MeterMsg) {
         self.meter.send_replace(meter);
+    }
+
+    /// 音量（dB）を通知する。口の開き具合に使うので、届いたらすぐ送る
+    pub fn publish_level(&self, db: f32) {
+        self.level.send_replace(db);
     }
 
     pub fn publish_config(&self, display: DisplaySettings) {
@@ -283,9 +300,11 @@ async fn client(mut socket: WebSocket, hub: Arc<Hub>, monitor: bool) {
     let _count = (!monitor).then(|| ClientCount::enter(&hub));
     let mut state_rx = hub.state.subscribe();
     let mut meter_rx = hub.meter.subscribe();
+    let mut level_rx = hub.level.subscribe();
     let mut config_rx = hub.config.subscribe();
     let mut reload_rx = hub.reload.subscribe();
     let mut want_meter = false;
+    let mut want_level = false;
 
     let current = *state_rx.borrow_and_update();
     let config = *config_rx.borrow_and_update();
@@ -317,7 +336,14 @@ async fn client(mut socket: WebSocket, hub: Arc<Hub>, monitor: bool) {
                         Ok(Incoming::Ack { seq }) if !monitor => {
                             let _ = hub.events.send(ClientEvent::Ack { seq, at: Instant::now() });
                         }
-                        Ok(Incoming::Subscribe { meter }) => want_meter = meter,
+                        Ok(Incoming::Subscribe { meter, level }) => {
+                            want_meter = meter;
+                            if level && !want_level {
+                                // 購読前の古い値は送らない
+                                level_rx.borrow_and_update();
+                            }
+                            want_level = level;
+                        }
                         _ => {}
                     },
                     Some(Ok(Message::Close(_)) | Err(_)) | None => break,
@@ -336,6 +362,10 @@ async fn client(mut socket: WebSocket, hub: Arc<Hub>, monitor: bool) {
                 }
                 Err(_) => break,
             },
+            changed = level_rx.changed(), if want_level => match changed {
+                Ok(()) => Outgoing::Level { db: *level_rx.borrow_and_update() },
+                Err(_) => break,
+            },
             changed = meter_rx.changed(), if want_meter => match changed {
                 Ok(()) => Outgoing::Meter(*meter_rx.borrow_and_update()),
                 Err(_) => break,
@@ -344,5 +374,37 @@ async fn client(mut socket: WebSocket, hub: Arc<Hub>, monitor: bool) {
         if !send(&mut socket, &msg).await {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subscribe_accepts_old_and_new_forms() {
+        // 古い描画ページは level を送らない
+        let m: Incoming = serde_json::from_str(r#"{"type":"subscribe","meter":true}"#).unwrap();
+        assert!(matches!(
+            m,
+            Incoming::Subscribe {
+                meter: true,
+                level: false
+            }
+        ));
+        let m: Incoming = serde_json::from_str(r#"{"type":"subscribe","level":true}"#).unwrap();
+        assert!(matches!(
+            m,
+            Incoming::Subscribe {
+                meter: false,
+                level: true
+            }
+        ));
+    }
+
+    #[test]
+    fn level_message_shape() {
+        let text = serde_json::to_string(&Outgoing::Level { db: -31.5 }).unwrap();
+        assert_eq!(text, r#"{"type":"level","db":-31.5}"#);
     }
 }

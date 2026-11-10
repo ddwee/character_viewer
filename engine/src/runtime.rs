@@ -262,7 +262,12 @@ fn spawn_avatar_watcher(hub: Arc<Hub>) {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         dir.hash(&mut h);
-        let walk = |d: &std::path::Path, h: &mut std::collections::hash_map::DefaultHasher| {
+        // パーツを `parts/` のようなフォルダに分けて置けるよう、1 段下のフォルダまで見る
+        fn walk(
+            d: &std::path::Path,
+            depth: u32,
+            h: &mut std::collections::hash_map::DefaultHasher,
+        ) {
             let Ok(entries) = std::fs::read_dir(d) else {
                 return;
             };
@@ -275,8 +280,13 @@ fn spawn_avatar_watcher(hub: Arc<Hub>) {
                 .collect();
             v.sort();
             v.hash(h);
-        };
-        walk(dir, &mut h);
+            if depth > 0 {
+                for (name, ..) in v.iter().filter(|e| e.3) {
+                    walk(&d.join(name), depth - 1, h);
+                }
+            }
+        }
+        walk(dir, 1, &mut h);
         h.finish()
     };
     std::thread::Builder::new()
@@ -520,6 +530,7 @@ impl Control {
             return;
         };
         let mut transitions = vec![];
+        let mut level = None;
         while let Ok(msg) = live.rx.pop() {
             match msg {
                 Msg::Meter {
@@ -528,7 +539,10 @@ impl Control {
                     voicing,
                     voiced,
                     frames,
-                } => self.meter = (level_db, env_db, voicing, voiced, frames),
+                } => {
+                    self.meter = (level_db, env_db, voicing, voiced, frames);
+                    level = Some(env_db);
+                }
                 Msg::Transition {
                     kind,
                     latency_us,
@@ -560,6 +574,10 @@ impl Control {
                 }
             };
             self.publish(state, line, detect_ms, Some(at));
+        }
+        // 状態の通知のあとに送る（発話の開始は状態の通知が最優先）
+        if let Some(db) = level {
+            self.hub.publish_level(db);
         }
     }
 

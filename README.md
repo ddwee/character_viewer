@@ -78,7 +78,7 @@
 | 音声入力 | `cpal`（WASAPI 共有モード） |
 | 発話判定 | 自前 DSP（HPF + エンベロープ + NSDF による声らしさ + ヒステリシス + 保持時間） |
 | 通信・API | `axum`（HTTP / WebSocket）、`tokio` |
-| 描画ページ | TypeScript + Vite + PixiJS v8（変化時だけ描画） |
+| 描画ページ | TypeScript + Vite + PixiJS v8（1 枚絵は変化時だけ描画、パーツは毎フレーム描画）。ボーン・ばね・口パクは自前の小さな実装 |
 | 設定画面 | TypeScript + Preact（同じ Vite プロジェクト） |
 | 更新・保守 | PowerShell スクリプト（`tools/`） |
 | イラスト | Krita（透過 PNG で書き出し） |
@@ -90,6 +90,9 @@
 - [x] **Step 3**: OBS に組み込み、録画で声と絵のずれを実測する（中央値 −41ms。気づかれない範囲）
 - [x] **Step 4**: アプリと設定画面。デバイス・感度・キャリブレーション・画像・まばたき・秒数・遅延測定・更新・保守を画面で操作
 - [ ] **Step 5**: 口パク・揺れなどの動き（パーツ分けした素材を使う）
+  - [x] パーツを重ねてボーン（親子関係と回転の中心）で動かす。呼吸・頭の揺れ・喋るときの動き・髪のばね・3 段階の口パク・まばたき
+  - [ ] 設定画面で回転の中心を調整する
+  - [ ] メッシュ変形（髪がしなる、体がつぶれる）
 - [ ] **Step 6**: 拡張（母音リップシンク、叫び差分、シーン連動、ホットキーでの表情切り替え）
 
 ## イラスト素材のルール
@@ -113,6 +116,54 @@
 ```
 
 `idle` 以外は省略でき、ない状態は近い絵で代用する（発話・放置 → 待機、寝落ち → 放置 → 待機）。
+
+### パーツを重ねてボーンで動かす
+
+`avatar.json` に `rig` を書くと、状態ごとの絵の代わりにパーツを重ねて動かす（`states` は使わない）。
+
+- パーツはすべて **同じキャンバスサイズで位置合わせ済み**（重ねるだけで元の絵になる）にする
+- 動いたときに隙間が見えないよう、**隠れる部分も描いておく**（前髪の下のおでこ、頭の下の首、後ろ髪の頭に隠れる部分）
+- 目・口は差分の線画だけ（肌は顔のパーツに描く）。眉は顔に描き込まない
+- パーツをフォルダ（`parts/` など）に分けてもよい。1 段下のフォルダまで、上書き保存を検出して読み込み直す
+
+```json
+{
+  "rig": {
+    "size": [1024, 1024],
+    "bones": {
+      "body":      { "pivot": [515, 1023] },
+      "neck":      { "parent": "body", "pivot": [518, 730] },
+      "head":      { "parent": "neck", "pivot": [518, 640] },
+      "brows":     { "parent": "head", "pivot": [511, 398] },
+      "backHair":  { "parent": "head", "pivot": [540, 250], "spring": { "length": 400, "frequency": 2.6 } },
+      "frontHair": { "parent": "head", "pivot": [518, 220], "spring": { "length": 320, "frequency": 3.4 } }
+    },
+    "layers": [
+      { "bone": "backHair", "image": "parts/01_back_hair.png" },
+      { "bone": "neck", "image": "parts/02_neck.png" },
+      { "bone": "body", "image": "parts/03_body.png" },
+      { "bone": "head", "image": "parts/04_face.png" },
+      { "bone": "head", "mouth": { "closed": "parts/05_mouth_closed.png", "half": "parts/05_mouth_half.png", "open": "parts/05_mouth_open.png" } },
+      { "bone": "head", "eyes": { "open": "parts/06_eyes_open.png", "half": "parts/06_eyes_half.png", "closed": "parts/06_eyes_closed.png" } },
+      { "bone": "brows", "image": "parts/07_eyebrows.png" },
+      { "bone": "frontHair", "image": "parts/08_front_hair.png" }
+    ]
+  }
+}
+```
+
+| 項目 | 意味 |
+|---|---|
+| `bones` | ボーン。`pivot` は回転の中心（画像の px）、`parent` は親（親が動くと一緒に動く） |
+| `layers` | パーツ。**下から順に重ねる**（親子とは無関係。後ろ髪は頭に付くが首より下に描ける） |
+| `spring` | 揺れもの。`length` 先端までの長さ、`frequency` 揺れの速さ（回/秒）、`damping` 収まりやすさ（0〜1）、`maxAngle` 最大の傾き（度）、`stretch` 伸び縮み |
+| `motion` | 動きの強さ（省略可）。`breath`（`period` 秒・`amount` 伸び率）、`sway`（待機中の `angle` 度・`shift` px・`period` 秒）、`talk`（喋るときの `bounce` px・`angle` 度・`shift` px）、`brows.lift` px、`neckShare` |
+| `states` | 状態ごとの姿勢（省略可）。`eyes`（`open`/`half`/`closed` で固定、`null` でまばたき）、`headAngle` 度、`headDrop` px、`breathSlow`・`breathDeep` 倍率、`sway` 倍率。既定では寝落ちで目を閉じてうつむく |
+
+動きを付けるボーンの名前は決まっている: `body`（呼吸）、`neck`・`head`（頭の揺れ）、`brows`（喋ると上がる）。
+
+口は、喋り始めはエンジンの「発話」の通知（最速）で即座に開き、喋っている間は音量（約 100 回/秒）で
+閉じ / 半開き / 開き を切り替える。音量は最近のピークを基準にした相対値で見るので、声の大きさやマイクの距離が変わっても動く。
 
 ## 技術メモ
 
@@ -181,6 +232,7 @@
 描画ページは、絵が変わるとき（状態の切り替え・まばたき）だけ描き直し、それ以外は何もしない。
 毎フレーム描き直す方式に比べて OBS の負荷が軽く、描き直しのタイミングによるちらつきも起きにくい
 （100 秒の試験で描き直しは 30 回。毎フレーム方式なら 6000 回）。
+パーツをボーンで動かす素材だけは、常に動いているので毎フレーム描く（パーツ 8〜12 枚程度なので負荷は小さい）。
 エンジンとの接続が一瞬切れても 2 秒間は今の絵を保つ。素材の読み込み直しは、新しい絵がすべて揃ってから入れ替える。
 
 ### 安全のため
