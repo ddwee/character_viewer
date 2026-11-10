@@ -45,6 +45,10 @@ export interface FrameInput {
   state: AvatarState;
   /** 口の開き具合（0〜1、喋っていなければ 0） */
   mouth: number;
+  /** 呼吸・揺れなどの動きを止める（設定画面でパーツを調整するとき） */
+  still?: boolean;
+  /** 動きを付けたあと、揺れものを計算する前に、ボーンに手を加える（調整画面で選んだボーンを揺らすなど） */
+  adjust?: (sk: Skeleton) => void;
 }
 
 /** 状態ごとの姿勢のうち、なめらかに移す数値 */
@@ -94,6 +98,11 @@ export class Animator {
 
     const sk = this.skeleton;
     sk.reset();
+    if (f.still) {
+      f.adjust?.(sk);
+      this.solveSprings(f.dt);
+      return;
+    }
 
     // 呼吸（吸うときに伸びる）
     this.breathPhase = (this.breathPhase + dt / (motion.breath.period * Math.max(0.1, p.breathSlow))) % 1;
@@ -126,9 +135,14 @@ export class Animator {
     const brows = sk.pose('brows');
     if (brows) brows.y = -motion.brows.lift * this.energy;
 
-    sk.solve();
+    f.adjust?.(sk);
+    this.solveSprings(f.dt);
+  }
 
-    // 揺れもの（親が動いたあとで、遅れを計算する）
+  /** 揺れもの（親が動いたあとで、遅れを計算する） */
+  private solveSprings(dt: number): void {
+    const sk = this.skeleton;
+    sk.solve();
     for (const { name, spring } of this.springs) {
       const def = sk.bone(name)!;
       const pose = sk.pose(name)!;
@@ -136,7 +150,7 @@ export class Animator {
       const rigid = sk.world.get(name)!;
       const pivot = apply(rigid, def.pivot);
       const tip = apply(rigid, spring.restTip(def.pivot));
-      const out = spring.step(pivot, tip, f.dt);
+      const out = spring.step(pivot, tip, dt);
       pose.rotation += out.rotation;
       pose.squashY *= out.stretch;
       sk.solve();

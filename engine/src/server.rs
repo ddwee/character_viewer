@@ -13,7 +13,8 @@
 //! - `{"type":"hello","version":1}`                         接続直後に 1 回
 //! - `{"type":"state","state":"talk","seq":12}`             状態（idle / talk / away / sleep）。接続直後にも現在の状態を送る
 //! - `{"type":"config","blink":true,"blinkRate":1,"mirror":false}`  見た目の設定。接続直後と変更時
-//! - `{"type":"reload"}`                                    イラスト素材が変わったので読み込み直す
+//! - `{"type":"reload","images":true}`                      イラスト素材が変わったので読み込み直す。
+//!   `images` が false なら変わったのは avatar.json だけ（画像は今のものを使い回せる）
 //! - `{"type":"meter","db":-41.2,"voicing":0.93,"voiced":true}`  音量など（subscribe した側だけ、約 30 回/秒）
 //! - `{"type":"level","db":-31.5}`                          音量だけ（subscribe した側だけ、音声の処理単位ごと＝約 100 回/秒）。口の開き具合用
 //!
@@ -77,7 +78,7 @@ enum Outgoing {
     Hello { version: u32 },
     State(StateMsg),
     Config(DisplaySettings),
-    Reload,
+    Reload { images: bool },
     Meter(MeterMsg),
     Level { db: f32 },
 }
@@ -103,7 +104,9 @@ pub struct Hub {
     /// 音量エンベロープ（dB）。音声の処理単位ごとに更新する
     level: watch::Sender<f32>,
     config: watch::Sender<DisplaySettings>,
-    reload: watch::Sender<u64>,
+    /// 読み込み直しの通し番号（何でも / 画像も読み直すもの）。
+    /// watch は最新の値しか届かないので、画像の読み直しは別の番号で数えて取りこぼさないようにする
+    reload: watch::Sender<(u64, u64)>,
     seq: AtomicU64,
     clients: AtomicUsize,
     events: mpsc::Sender<ClientEvent>,
@@ -125,7 +128,7 @@ impl Hub {
             meter: watch::Sender::new(MeterMsg::default()),
             level: watch::Sender::new(-120.0),
             config: watch::Sender::new(display),
-            reload: watch::Sender::new(0),
+            reload: watch::Sender::new((0, 0)),
             seq: AtomicU64::new(0),
             clients: AtomicUsize::new(0),
             events,
@@ -164,7 +167,15 @@ impl Hub {
 
     /// イラスト素材を読み込み直させる
     pub fn reload_avatar(&self) {
-        self.reload.send_modify(|n| *n += 1);
+        self.reload.send_modify(|(n, images)| {
+            *n += 1;
+            *images += 1;
+        });
+    }
+
+    /// avatar.json だけが変わった（画像はそのまま）ことを知らせる
+    pub fn reload_manifest(&self) {
+        self.reload.send_modify(|(n, _)| *n += 1);
     }
 
     pub fn avatar_dir(&self) -> PathBuf {
@@ -308,7 +319,7 @@ async fn client(mut socket: WebSocket, hub: Arc<Hub>, monitor: bool) {
 
     let current = *state_rx.borrow_and_update();
     let config = *config_rx.borrow_and_update();
-    reload_rx.borrow_and_update();
+    let mut images_seen = reload_rx.borrow_and_update().1;
     if !send(
         &mut socket,
         &Outgoing::Hello {
@@ -357,8 +368,10 @@ async fn client(mut socket: WebSocket, hub: Arc<Hub>, monitor: bool) {
             },
             changed = reload_rx.changed() => match changed {
                 Ok(()) => {
-                    reload_rx.borrow_and_update();
-                    Outgoing::Reload
+                    let images = reload_rx.borrow_and_update().1;
+                    let msg = Outgoing::Reload { images: images != images_seen };
+                    images_seen = images;
+                    msg
                 }
                 Err(_) => break,
             },
@@ -400,6 +413,20 @@ mod tests {
                 level: true
             }
         ));
+    }
+
+    #[test]
+    fn manifest_reload_does_not_count_as_image_reload() {
+        let (hub, _rx) = Hub::new(DisplaySettings::default(), PathBuf::new());
+        let rx = hub.reload.subscribe();
+        hub.reload_avatar();
+        hub.reload_manifest();
+        // 画像の読み直しの後に avatar.json だけの通知が来ても、画像の読み直しは取りこぼさない
+        assert_eq!(*rx.borrow(), (2, 1));
+        hub.reload_manifest();
+        assert_eq!(*rx.borrow(), (3, 1));
+        let text = serde_json::to_string(&Outgoing::Reload { images: false }).unwrap();
+        assert_eq!(text, r#"{"type":"reload","images":false}"#);
     }
 
     #[test]

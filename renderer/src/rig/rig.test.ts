@@ -254,3 +254,83 @@ test('動き: 長時間動かしても値が発散しない', () => {
     assert.ok(Math.abs(p.rotation) < 0.2 && Math.abs(p.y) < 30, `${name} ${JSON.stringify(p)}`);
   }
 });
+
+// ───────── 調整画面の道具 ─────────
+
+import { EditHistory, fit, invert, setIn, setPivot, setSpringTip, toImage, toScreen } from './edit.ts';
+import { multiply } from './bones.ts';
+
+test('調整: 書き換えは元の rig を変えず、知らない項目を残す', () => {
+  const raw = { bones: { head: { pivot: [1, 2], memo: 'x' } }, future: 1 };
+  const next = setPivot(raw, 'head', [10.4, 20.6]);
+  assert.deepEqual(raw.bones.head.pivot, [1, 2]);
+  assert.deepEqual(next, { bones: { head: { pivot: [10, 21], memo: 'x' } }, future: 1 });
+  // 途中の項目がなければ作る / undefined なら消す
+  const m = setIn(next, ['motion', 'talk', 'bounce'], 4);
+  assert.equal((m.motion as { talk: { bounce: number } }).talk.bounce, 4);
+  assert.equal('memo' in (setIn(m, ['bones', 'head', 'memo'], undefined).bones as { head: object }).head, false);
+});
+
+test('調整: 揺れものの先端から長さと向きを決め、読み込むと同じ先端になる', () => {
+  const raw = setSpringTip({ bones: { hair: { pivot: [100, 100] } } }, 'hair', [100, 100], [160, 180]);
+  const rig = parseRig({ bones: raw.bones, layers: [{ bone: 'hair', image: 'a.png' }] });
+  const s = new TipSpring(rig.bones[0].spring!);
+  nearV(s.restTip([100, 100]), [160, 180], 0.2);
+  assert.equal(rig.bones[0].spring!.length, 100);
+});
+
+test('調整: 画面と画像の座標を行き来できる', () => {
+  const f = fit([1024, 1024], 600, 400);
+  const p = toScreen(f, [512, 1024]);
+  nearV(toImage(f, p), [512, 1024]);
+  // 縦に収まり、横は中央
+  assert.ok(f.scale * 1024 <= 400 && f.ox > 0);
+  const m = localMatrix([3, 4], { ...restPose(), rotation: 0.4, scaleX: 1.2, x: 5 });
+  const id = multiply(m, invert(m)!);
+  nearV([id.a, id.b, id.c, id.d, id.tx, id.ty], [1, 0, 0, 1, 0, 0]);
+});
+
+test('調整: 続けた変更は 1 回分として元に戻せる', () => {
+  const h = new EditHistory<number>(50, 600);
+  h.record(0, 0);
+  h.record(1, 100); // スライダーを動かし続けている
+  h.record(2, 200);
+  h.cut(); // 指を離した
+  h.record(3, 300);
+  assert.equal(h.size, 2);
+  assert.equal(h.undo(), 3);
+  assert.equal(h.undo(), 0);
+  assert.equal(h.undo(), undefined);
+});
+
+// ───────── 瞬き専用のコマ ─────────
+
+import { eyeFile } from './manifest.ts';
+
+test('目: 瞬きは瞬き専用のコマ、状態で固定するときは表情の絵を使う', () => {
+  const layers = [
+    { bone: 'head', eyes: { open: 'o.png', half: 'smug.png', closed: 'smile.png', blink: { half: 'bh.png', closed: 'bc.png' } } },
+  ];
+  const rig = parseRig({ ...SAMPLE, layers });
+  const l = rig.layers[0];
+  assert.ok(l.kind === 'eyes');
+  assert.equal(eyeFile(l, 'half', true), 'bh.png');
+  assert.equal(eyeFile(l, 'closed', true), 'bc.png');
+  assert.equal(eyeFile(l, 'closed', false), 'smile.png'); // 寝落ちなど
+  assert.equal(eyeFile(l, 'half', false), 'smug.png');
+  assert.equal(eyeFile(l, 'open', true), 'o.png');
+  assert.deepEqual(rigImages(rig).sort(), ['bc.png', 'bh.png', 'o.png', 'smile.png', 'smug.png']);
+});
+
+test('目: 瞬き専用のコマがなければ、表情の絵で瞬きする（今までどおり）', () => {
+  const rig = parseRig({ ...SAMPLE, layers: [{ bone: 'head', eyes: { open: 'o.png', half: 'h.png', closed: 'c.png' } }] });
+  const l = rig.layers[0];
+  assert.ok(l.kind === 'eyes');
+  assert.equal(eyeFile(l, 'closed', true), 'c.png');
+  assert.equal(eyeFile(l, 'half', true), 'h.png');
+  // 閉じたコマだけなら、半目の代わりも閉じたコマ
+  const only = parseRig({ ...SAMPLE, layers: [{ bone: 'head', eyes: { open: 'o.png', half: 'h.png', blink: { closed: 'bc.png' } } }] }).layers[0];
+  assert.ok(only.kind === 'eyes');
+  assert.equal(eyeFile(only, 'half', true), 'bc.png');
+  assert.throws(() => parseRig({ ...SAMPLE, layers: [{ bone: 'head', eyes: { open: 'o.png', blink: 'x.png' } }] }), /eyes\.blink/);
+});

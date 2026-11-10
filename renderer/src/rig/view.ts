@@ -5,7 +5,7 @@
 import { Container, Matrix, Sprite, type Texture } from 'pixi.js';
 
 import type { Vec } from './bones.ts';
-import type { Rig, RigLayer, EyeShape } from './manifest.ts';
+import { blinkFrames, eyeFile, mouthFile, type EyeShape, type Rig, type RigLayer } from './manifest.ts';
 import type { Mouth } from './mouth.ts';
 import type { Skeleton } from './bones.ts';
 
@@ -42,22 +42,20 @@ export class RigView {
     const first = this.parts[0].sprite.texture;
     this.size = rig.size[0] > 0 && rig.size[1] > 0 ? rig.size : [first.width, first.height];
     const eyes = rig.layers.filter((l) => l.kind === 'eyes');
-    this.canBlink = eyes.length > 0 && eyes.every((l) => l.closed !== undefined);
-    this.hasHalfEyes = eyes.length > 0 && eyes.every((l) => l.half !== undefined);
+    this.canBlink = eyes.length > 0 && eyes.every((l) => blinkFrames(l).closed !== undefined);
+    this.hasHalfEyes = eyes.length > 0 && eyes.every((l) => blinkFrames(l).half !== undefined);
   }
 
-  update(sk: Skeleton, mouth: Mouth, eyes: EyeShape): void {
+  /** `blinking` は目が瞬きの途中（瞬き専用のコマを使う）。false なら状態で固定した表情 */
+  update(sk: Skeleton, mouth: Mouth, eyes: EyeShape, blinking = true): void {
     for (const { layer, sprite } of this.parts) {
       const w = sk.sprite.get(layer.bone)!;
       this.m.set(w.a, w.b, w.c, w.d, w.tx, w.ty);
       sprite.setFromMatrix(this.m);
 
       let file: string | undefined;
-      if (layer.kind === 'mouth') {
-        file = mouth === 'open' ? layer.open : mouth === 'half' ? (layer.half ?? layer.open) : layer.closed;
-      } else if (layer.kind === 'eyes') {
-        file = eyes === 'closed' ? (layer.closed ?? layer.open) : eyes === 'half' ? (layer.half ?? layer.closed ?? layer.open) : layer.open;
-      }
+      if (layer.kind === 'mouth') file = mouthFile(layer, mouth);
+      else if (layer.kind === 'eyes') file = eyeFile(layer, eyes, blinking);
       if (file !== undefined) {
         const t = this.textures.get(file)!;
         if (sprite.texture !== t) sprite.texture = t;

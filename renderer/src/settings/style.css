@@ -982,3 +982,128 @@ select {
     transform: rotate(360deg);
   }
 }
+
+/* ───── パーツの調整 ───── */
+
+.rig-editor {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  gap: 18px;
+}
+@media (max-width: 900px) {
+  .rig-editor {
+    grid-template-columns: 1fr;
+  }
+}
+.rig-canvas,
+.rig-loading {
+  width: 100%;
+  height: min(62vh, 560px);
+  min-height: 320px;
+  display: block;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  touch-action: none;
+}
+.rig-loading {
+  display: grid;
+  place-items: center;
+}
+.rig-modes {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  overflow: hidden;
+}
+.seg button {
+  font: inherit;
+  font-size: 13.5px;
+  padding: 5px 14px;
+  border: none;
+  background: var(--card);
+  color: var(--text);
+  cursor: pointer;
+}
+.seg button.on {
+  background: var(--accent);
+  color: #fff;
+}
+.rig-side {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  min-width: 0;
+}
+.bone-list {
+  display: grid;
+  gap: 4px;
+}
+.bone {
+  font: inherit;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--card);
+  color: var(--text);
+  cursor: pointer;
+}
+.bone:hover {
+  border-color: var(--accent);
+}
+.bone.on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  font-weight: 600;
+}
+.bone .tag {
+  font-size: 11.5px;
+  font-weight: 400;
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.bone .muted {
+  margin-left: auto;
+  font-weight: 400;
+}
+.bone-detail {
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+}
+.bone-detail h3 {
+  margin: 0 0 8px;
+  font-size: 15px;
+}
+/* 横幅が狭いので、ラベルとつまみを縦に並べる */
+.bone-detail .row {
+  grid-template-columns: 1fr;
+  gap: 4px;
+}
+.pivot-inputs {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.pivot-inputs input {
+  width: 72px;
+  font: inherit;
+  padding: 3px 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--card);
+  color: var(--text);
+}

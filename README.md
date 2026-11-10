@@ -30,6 +30,7 @@
 | ホーム | いまの状態（話している / 待機 / 放置 / 寝落ち）、OBS と同じ表示のプレビュー、OBS の接続数、反応の速さの実績、問題の通知 |
 | マイク | デバイス・チャンネルの選択、しきい値の位置つきの音量メーター、感度のスライダー、**自動で調整する**（約 40 秒のキャリブレーション） |
 | 画像と動き | 状態ごとの絵（通常・半目・閉じ目）をドラッグ＆ドロップで設定、プレビューで各状態を試す、まばたきの有無と頻度、左右反転、放置・寝落ちまでの秒数、素材のフォルダ |
+| パーツの調整 | パーツで動かす素材の、回転の中心（●）と揺れものの先端（■）をドラッグで調整、選んだパーツを揺らして確かめる、揺れものの硬さ・収まりやすさ、動きの強さ、「動きを見る」で OBS と同じ動き（喋るまね付き）、元に戻す |
 | OBS | ブラウザソースの追加手順とコピー用 URL、ドックの追加、**声と絵のずれの測定**（最近の録画を選ぶだけ）、ffmpeg のインストール |
 | メンテナンス | 部品のバージョン、**更新を確認 / 更新する**、作り直す、前の版に戻す、PowerShell を開く、ログ、フォルダを開く、自動起動、アプリの終了 |
 
@@ -91,7 +92,7 @@
 - [x] **Step 4**: アプリと設定画面。デバイス・感度・キャリブレーション・画像・まばたき・秒数・遅延測定・更新・保守を画面で操作
 - [ ] **Step 5**: 口パク・揺れなどの動き（パーツ分けした素材を使う）
   - [x] パーツを重ねてボーン（親子関係と回転の中心）で動かす。呼吸・頭の揺れ・喋るときの動き・髪のばね・3 段階の口パク・まばたき
-  - [ ] 設定画面で回転の中心を調整する
+  - [x] 設定画面で回転の中心を調整する（パーツの調整ページ。変えるとすぐ OBS の表示にも反映）
   - [ ] メッシュ変形（髪がしなる、体がつぶれる）
 - [ ] **Step 6**: 拡張（母音リップシンク、叫び差分、シーン連動、ホットキーでの表情切り替え）
 
@@ -144,7 +145,9 @@
       { "bone": "body", "image": "parts/03_body.png" },
       { "bone": "head", "image": "parts/04_face.png" },
       { "bone": "head", "mouth": { "closed": "parts/05_mouth_closed.png", "half": "parts/05_mouth_half.png", "open": "parts/05_mouth_open.png" } },
-      { "bone": "head", "eyes": { "open": "parts/06_eyes_open.png", "half": "parts/06_eyes_half.png", "closed": "parts/06_eyes_closed.png" } },
+      { "bone": "head", "eyes": {
+          "open": "parts/06_eyes_open.png", "half": "parts/06_eyes_half.png", "closed": "parts/06_eyes_closed.png",
+          "blink": { "half": "parts/06_eyes_half_blink.png", "closed": "parts/06_eyes_closed_blink.png" } } },
       { "bone": "brows", "image": "parts/07_eyebrows.png" },
       { "bone": "frontHair", "image": "parts/08_front_hair.png" }
     ]
@@ -156,11 +159,15 @@
 |---|---|
 | `bones` | ボーン。`pivot` は回転の中心（画像の px）、`parent` は親（親が動くと一緒に動く） |
 | `layers` | パーツ。**下から順に重ねる**（親子とは無関係。後ろ髪は頭に付くが首より下に描ける） |
+| `eyes` | 目。`half`・`closed` は表情の絵（寝落ちなど `states` の `eyes` で固定するとき）。`blink` に瞬き専用のコマ（まぶたが下りてくる絵）を書くと瞬きはそちらを使う。`blink` がなければ `half`・`closed` で瞬きする |
 | `spring` | 揺れもの。`length` 先端までの長さ、`frequency` 揺れの速さ（回/秒）、`damping` 収まりやすさ（0〜1）、`maxAngle` 最大の傾き（度）、`stretch` 伸び縮み |
 | `motion` | 動きの強さ（省略可）。`breath`（`period` 秒・`amount` 伸び率）、`sway`（待機中の `angle` 度・`shift` px・`period` 秒）、`talk`（喋るときの `bounce` px・`angle` 度・`shift` px）、`brows.lift` px、`neckShare` |
 | `states` | 状態ごとの姿勢（省略可）。`eyes`（`open`/`half`/`closed` で固定、`null` でまばたき）、`headAngle` 度、`headDrop` px、`breathSlow`・`breathDeep` 倍率、`sway` 倍率。既定では寝落ちで目を閉じてうつむく |
 
 動きを付けるボーンの名前は決まっている: `body`（呼吸）、`neck`・`head`（頭の揺れ）、`brows`（喋ると上がる）。
+
+回転の中心・揺れもの・動きの強さは、設定画面の「パーツの調整」でドラッグやスライダーで変えられる（avatar.json の rig が書き換わる）。
+avatar.json だけが変わったときは、描画ページは画像を読み直さずに組み直すので、調整がすぐ OBS の表示に反映される。
 
 口は、喋り始めはエンジンの「発話」の通知（最速）で即座に開き、喋っている間は音量（約 100 回/秒）で
 閉じ / 半開き / 開き を切り替える。音量は最近のピークを基準にした相対値で見るので、声の大きさやマイクの距離が変わっても動く。

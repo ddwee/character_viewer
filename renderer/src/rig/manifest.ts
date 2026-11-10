@@ -16,7 +16,8 @@
 //   "layers": [                                   ← 下から順に重ねる
 //     { "bone": "backHair", "image": "parts/01_back_hair.png" },
 //     { "bone": "head", "mouth": { "closed": "…", "half": "…", "open": "…" } },
-//     { "bone": "head", "eyes":  { "open": "…", "half": "…", "closed": "…" } },
+//     { "bone": "head", "eyes":  { "open": "…", "half": "…", "closed": "…",
+//                                 "blink": { "half": "…", "closed": "…" } } },   ← 瞬き専用のコマ（省略可）
 //     …
 //   ],
 //   "motion": { "breath": { "amount": 0.008 } },   ← 動きの強さ（省略すると既定値）
@@ -42,7 +43,17 @@ export interface RigBone {
 export type RigLayer =
   | { kind: 'image'; bone: string; image: string }
   | { kind: 'mouth'; bone: string; closed: string; half?: string; open: string }
-  | { kind: 'eyes'; bone: string; open: string; half?: string; closed?: string };
+  | {
+      kind: 'eyes';
+      bone: string;
+      open: string;
+      /** 表情の半目・閉じ目（状態で目を固定するとき。瞬き専用のコマがなければ瞬きにも使う） */
+      half?: string;
+      closed?: string;
+      /** 瞬き専用のコマ（まぶたが下りてくる絵など） */
+      blinkHalf?: string;
+      blinkClosed?: string;
+    };
 
 export interface MotionConfig {
   breath: {
@@ -192,12 +203,16 @@ export function parseRig(raw: unknown): Rig {
     }
     if (isObj(l.eyes)) {
       const e = l.eyes;
+      if (e.blink !== undefined && !isObj(e.blink)) throw new Error(`${where}.eyes.blink は { "half": …, "closed": … } の形で書いてください`);
+      const b = isObj(e.blink) ? e.blink : {};
       return {
         kind: 'eyes',
         bone,
         open: str(e.open, `${where}.eyes.open`),
         half: optStr(e.half, `${where}.eyes.half`),
         closed: optStr(e.closed, `${where}.eyes.closed`),
+        blinkHalf: optStr(b.half, `${where}.eyes.blink.half`),
+        blinkClosed: optStr(b.closed, `${where}.eyes.blink.closed`),
       };
     }
     throw new Error(`${where} には image・mouth・eyes のどれかを書いてください`);
@@ -225,6 +240,31 @@ export function parseRig(raw: unknown): Rig {
 
 /** パーツで使う画像の一覧（読み込み用） */
 export function rigImages(rig: Rig): string[] {
-  const files = rig.layers.flatMap((l) => (l.kind === 'image' ? [l.image] : l.kind === 'mouth' ? [l.closed, l.half, l.open] : [l.open, l.half, l.closed]));
+  const files = rig.layers.flatMap((l) =>
+    l.kind === 'image' ? [l.image] : l.kind === 'mouth' ? [l.closed, l.half, l.open] : [l.open, l.half, l.closed, l.blinkHalf, l.blinkClosed],
+  );
   return [...new Set(files.filter((f): f is string => f !== undefined))];
+}
+
+type EyesLayer = Extract<RigLayer, { kind: 'eyes' }>;
+
+/** 瞬きに使うコマ（瞬き専用のコマがあればそれ、なければ表情の半目・閉じ目） */
+export function blinkFrames(l: EyesLayer): { half?: string; closed?: string } {
+  return l.blinkClosed !== undefined ? { half: l.blinkHalf, closed: l.blinkClosed } : { half: l.half, closed: l.closed };
+}
+
+/**
+ * 目のパーツで表示する画像。
+ * `blinking` は瞬きの途中（瞬き専用のコマを使う）、そうでなければ状態で固定した表情
+ */
+export function eyeFile(l: EyesLayer, eye: EyeShape, blinking: boolean): string {
+  const f = blinking ? blinkFrames(l) : l;
+  if (eye === 'closed') return f.closed ?? l.open;
+  if (eye === 'half') return f.half ?? f.closed ?? l.open;
+  return l.open;
+}
+
+/** 口のパーツで表示する画像 */
+export function mouthFile(l: Extract<RigLayer, { kind: 'mouth' }>, mouth: 'closed' | 'half' | 'open'): string {
+  return mouth === 'open' ? l.open : mouth === 'half' ? (l.half ?? l.open) : l.closed;
 }

@@ -11,12 +11,14 @@ import { Images } from './pages/Images';
 import { Maintenance } from './pages/Maintenance';
 import { Mic } from './pages/Mic';
 import { Obs } from './pages/Obs';
+import { Rig } from './pages/Rig';
 import { SettingsProvider, useSettings, useStatus, useToasts } from './store';
 
 const PAGES = [
   { id: 'home', label: 'ホーム', icon: '🏠' },
   { id: 'mic', label: 'マイク', icon: '🎙️' },
   { id: 'images', label: '画像と動き', icon: '🖼️' },
+  { id: 'rig', label: 'パーツの調整', icon: '🦴' },
   { id: 'obs', label: 'OBS', icon: '📺' },
   { id: 'maintenance', label: 'メンテナンス', icon: '🛠️' },
 ] as const;
@@ -76,6 +78,7 @@ function App() {
         {page === 'home' && <Home status={status} go={go} />}
         {page === 'mic' && <Mic status={status} />}
         {page === 'images' && <Images />}
+        {page === 'rig' && <Rig />}
         {page === 'obs' && <Obs />}
         {page === 'maintenance' && <Maintenance />}
       </main>

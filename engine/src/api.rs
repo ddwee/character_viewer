@@ -71,6 +71,7 @@ pub fn routes(state: Arc<ApiState>) -> Router {
         .route("/api/calibration/cancel", post(cal_cancel))
         .route("/api/avatar", get(avatar_view))
         .route("/api/avatar/reload", post(avatar_reload))
+        .route("/api/avatar/rig", get(rig_get).put(rig_put))
         .route(
             "/api/avatar/{state}/{slot}",
             put(avatar_put).layer(DefaultBodyLimit::max(avatar_files::MAX_BYTES + 1024)),
@@ -237,6 +238,24 @@ async fn avatar_view(State(st): S) -> Response {
 async fn avatar_reload(State(st): S) -> Response {
     st.rt.hub.reload_avatar();
     ok()
+}
+
+async fn rig_get(State(st): S) -> Response {
+    match avatar_files::get_rig(&avatar_dir(&st)) {
+        Ok(rig) => Json(json!({ "rig": rig })).into_response(),
+        Err(e) => bad(e),
+    }
+}
+
+/// パーツの調整（設定画面）。avatar.json の rig だけを書き換え、画像は読み直させない
+async fn rig_put(State(st): S, Json(rig): Json<serde_json::Value>) -> Response {
+    match avatar_files::set_rig(&avatar_dir(&st), rig) {
+        Ok(()) => {
+            st.rt.hub.reload_manifest();
+            ok()
+        }
+        Err(e) => bad(e),
+    }
 }
 
 #[derive(Deserialize)]

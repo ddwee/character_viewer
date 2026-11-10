@@ -256,55 +256,74 @@ pub fn start(
     }
 }
 
-/// 素材フォルダのファイルが変わったら（Krita で上書き保存したときなど）描画ページに読み込み直させる
+/// 素材フォルダのファイルが変わったら（Krita で上書き保存したときなど）描画ページに読み込み直させる。
+/// avatar.json だけが変わったとき（設定画面でパーツを調整したときなど）は、画像を読み直さなくてよいと伝える
 fn spawn_avatar_watcher(hub: Arc<Hub>) {
-    let fingerprint = |dir: &std::path::Path| -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        dir.hash(&mut h);
-        // パーツを `parts/` のようなフォルダに分けて置けるよう、1 段下のフォルダまで見る
-        fn walk(
-            d: &std::path::Path,
-            depth: u32,
-            h: &mut std::collections::hash_map::DefaultHasher,
-        ) {
-            let Ok(entries) = std::fs::read_dir(d) else {
-                return;
-            };
-            let mut v: Vec<_> = entries
-                .flatten()
-                .filter_map(|e| {
-                    let m = e.metadata().ok()?;
-                    Some((e.file_name(), m.len(), m.modified().ok(), m.is_dir()))
-                })
-                .collect();
-            v.sort();
-            v.hash(h);
-            if depth > 0 {
-                for (name, ..) in v.iter().filter(|e| e.3) {
-                    walk(&d.join(name), depth - 1, h);
-                }
-            }
-        }
-        walk(dir, 1, &mut h);
-        h.finish()
-    };
     std::thread::Builder::new()
         .name("avatar-watch".into())
         .spawn(move || {
-            let mut last = fingerprint(&hub.avatar_dir());
+            let mut last = avatar_fingerprint(&hub.avatar_dir());
             loop {
                 std::thread::sleep(Duration::from_millis(800));
-                let dir = hub.avatar_dir();
-                let now = fingerprint(&dir);
-                if now != last {
-                    last = now;
+                let now = avatar_fingerprint(&hub.avatar_dir());
+                if now.images != last.images {
                     log::info!("イラスト素材の変更を検出しました。描画ページに読み込み直させます");
                     hub.reload_avatar();
+                } else if now.manifest != last.manifest {
+                    hub.reload_manifest();
                 }
+                last = now;
             }
         })
         .expect("監視スレッドを起動できません");
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct AvatarFingerprint {
+    /// avatar.json
+    manifest: u64,
+    /// それ以外（画像など）とフォルダの場所
+    images: u64,
+}
+
+/// 素材フォルダの中身の指紋（名前・大きさ・更新時刻）。中身は読まないので軽い
+fn avatar_fingerprint(dir: &std::path::Path) -> AvatarFingerprint {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    type Entry = (std::ffi::OsString, u64, Option<std::time::SystemTime>, bool);
+    let list = |d: &std::path::Path| -> Vec<Entry> {
+        let Ok(entries) = std::fs::read_dir(d) else {
+            return vec![];
+        };
+        let mut v: Vec<_> = entries
+            .flatten()
+            .filter_map(|e| {
+                let m = e.metadata().ok()?;
+                Some((e.file_name(), m.len(), m.modified().ok(), m.is_dir()))
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let mut manifest = DefaultHasher::new();
+    let mut images = DefaultHasher::new();
+    dir.hash(&mut images);
+    for e in list(dir) {
+        // avatar.json と、保存途中の avatar.json.tmp
+        if e.0.to_string_lossy().starts_with("avatar.json") {
+            e.hash(&mut manifest);
+        } else if e.3 {
+            // パーツを `parts/` のようなフォルダに分けて置けるよう、1 段下のフォルダまで見る
+            e.0.hash(&mut images);
+            list(&dir.join(&e.0)).hash(&mut images);
+        } else {
+            e.hash(&mut images);
+        }
+    }
+    AvatarFingerprint {
+        manifest: manifest.finish(),
+        images: images.finish(),
+    }
 }
 
 // ───────────────────────── 制御スレッド ─────────────────────────
@@ -911,5 +930,35 @@ fn analyze_calibration(
             })
             .collect(),
         wav,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fingerprint_separates_manifest_from_images() {
+        let d = std::env::temp_dir().join(format!("cv-watch-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("parts")).unwrap();
+        std::fs::write(d.join("avatar.json"), "{}").unwrap();
+        std::fs::write(d.join("parts").join("a.png"), "x").unwrap();
+        let a = avatar_fingerprint(&d);
+
+        std::fs::write(d.join("avatar.json"), "{\"rig\":{}}").unwrap();
+        let b = avatar_fingerprint(&d);
+        assert_ne!(a.manifest, b.manifest);
+        assert_eq!(
+            a.images, b.images,
+            "avatar.json だけの変更は画像の変更にしない"
+        );
+
+        // 1 段下のフォルダの画像の上書き
+        std::fs::write(d.join("parts").join("a.png"), "xy").unwrap();
+        let c = avatar_fingerprint(&d);
+        assert_ne!(b.images, c.images);
+        assert_eq!(b.manifest, c.manifest);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

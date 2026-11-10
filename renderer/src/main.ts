@@ -56,7 +56,10 @@ interface RigAvatar {
   rig: Rig;
   view: RigView;
   animator: Animator;
-  textures: Texture[];
+  /** ファイル名 → テクスチャ（rig だけ変わったときは使い回す） */
+  textures: Map<string, Texture>;
+  /** 読み込んだ rig の JSON（変わっていなければ組み直さない） */
+  source: string;
 }
 
 /** 見た目の設定（設定画面で変える） */
@@ -70,7 +73,8 @@ type ServerMsg =
   | { type: 'hello'; version: number }
   | { type: 'state'; state: AvatarState; seq: number }
   | ({ type: 'config' } & DisplayConfig)
-  | { type: 'reload' }
+  /** images が false なら変わったのは avatar.json だけ（古いエンジンは images を送らない） */
+  | { type: 'reload'; images?: boolean }
   | { type: 'meter'; db: number; voicing: number; voiced: boolean }
   | { type: 'level'; db: number };
 
@@ -195,11 +199,13 @@ function drawRig(now: number, av: RigAvatar): void {
   mouthShape = mouth.update(now);
 
   const prevEye = eye;
-  eye = av.animator.eyesFor(current) ?? (blinksIn(current) ? blink.update(now, av.view.hasHalfEyes) : 'open');
-  if (prevEye === 'open' && eye !== 'open') stats.blinks++;
+  // 状態で目を固定するとき（寝落ちなど）は表情の絵、そうでなければ瞬き
+  const fixed = av.animator.eyesFor(current);
+  eye = fixed ?? (blinksIn(current) ? blink.update(now, av.view.hasHalfEyes) : 'open');
+  if (prevEye === 'open' && eye !== 'open' && !fixed) stats.blinks++;
 
   av.animator.update({ t: now / 1000, dt, state: current, mouth: current === 'talk' ? mouth.amount : 0 });
-  av.view.update(av.animator.skeleton, mouthShape, eye);
+  av.view.update(av.animator.skeleton, mouthShape, eye, fixed === undefined);
 }
 
 function frame(now: number): void {
@@ -269,32 +275,44 @@ async function loadLook(entry: StateEntry): Promise<Look> {
 }
 
 /**
- * 素材を読み込む。読み込み直しのときは、新しい絵がすべて揃ってから入れ替える
- * （途中で失敗したら今の絵のまま）
+ * パーツの素材を用意する。`reuse` にある画像は読み直さずに使う（rig だけ変わったとき）。
+ * 新しく読んだ画像は GPU へ送るところまで済ませる
  */
-/** パーツの素材を読み込む（GPU へ送るところまで） */
-async function loadRig(raw: unknown): Promise<RigAvatar> {
+async function loadRig(raw: unknown, reuse?: Map<string, Texture>): Promise<RigAvatar> {
   const rig = parseRig(raw);
   const files = rigImages(rig);
-  const loaded = await Promise.all(files.map(loadTexture));
-  await app.renderer.prepare.upload(loaded);
-  const textures = new Map(files.map((f, i) => [f, loaded[i]]));
-  return { rig, view: new RigView(rig, textures), animator: new Animator(rig), textures: loaded };
+  const textures = new Map<string, Texture>();
+  const fresh: Texture[] = [];
+  await Promise.all(
+    files.map(async (f) => {
+      let t = reuse?.get(f);
+      if (!t) fresh.push((t = await loadTexture(f)));
+      textures.set(f, t);
+    }),
+  );
+  await app.renderer.prepare.upload(fresh);
+  return { rig, view: new RigView(rig, textures), animator: new Animator(rig), textures, source: JSON.stringify(raw) };
 }
 
-/** 入れ替える前の絵を、描き替えたあとで GPU とキャッシュから外す */
+/** 入れ替える前の絵を、描き替えたあとで GPU とキャッシュから外す（新しい絵でも使うものは残す） */
 function retireOld(oldLooks: Texture[], oldRig: RigAvatar | null): void {
   requestAnimationFrame(() => {
-    const keep = new Set([...looks.values()].flatMap((l) => [l.open, l.half, l.closed]));
+    const keep = new Set<Texture | undefined>([...looks.values()].flatMap((l) => [l.open, l.half, l.closed]));
+    for (const t of rigAvatar?.textures.values() ?? []) keep.add(t);
     for (const t of oldLooks) if (!keep.has(t)) t.destroy(true);
     if (oldRig) {
       oldRig.view.destroy();
-      for (const t of oldRig.textures) t.destroy(true);
+      for (const t of oldRig.textures.values()) if (!keep.has(t)) t.destroy(true);
     }
   });
 }
 
-async function loadAvatar(): Promise<void> {
+/**
+ * 素材を読み込む。読み込み直しのときは、新しい絵がすべて揃ってから入れ替える
+ * （途中で失敗したら今の絵のまま）。
+ * `images` が false なら avatar.json だけが変わったので、パーツの画像は読み直さない
+ */
+async function loadAvatar(images = true): Promise<void> {
   avatarVersion++;
   const res = await fetch(`avatar/avatar.json?v=${avatarVersion}`, { cache: 'no-store' });
   if (!res.ok) throw new Error(`avatar/avatar.json を読み込めません（${res.status}）`);
@@ -303,7 +321,9 @@ async function loadAvatar(): Promise<void> {
   const textures = (m: Map<AvatarState, Look>) => [...m.values()].flatMap((l) => [l.open, l.half, l.closed]).filter((t): t is Texture => !!t);
 
   if (manifest.rig !== undefined) {
-    const next = await loadRig(manifest.rig);
+    // 同じ rig なら何もしない（設定画面の保存と、フォルダの監視で 2 回通知が来る）
+    if (!images && rigAvatar?.source === JSON.stringify(manifest.rig)) return;
+    const next = await loadRig(manifest.rig, images ? undefined : rigAvatar?.textures);
     const oldLooks = textures(looks);
     const oldRig = rigAvatar;
     looks.clear();
@@ -347,22 +367,22 @@ async function loadAvatar(): Promise<void> {
 }
 
 let reloading: Promise<void> | null = null;
-let reloadAgain = false;
+/** 読み込み中に届いた通知（次に読み込み直すときに画像も読み直すか） */
+let reloadAgain: { images: boolean } | null = null;
 
 /** 素材が変わったという通知で読み込み直す（連続した通知はまとめる） */
-function reloadAvatar(): void {
+function reloadAvatar(images = true): void {
   if (reloading) {
-    reloadAgain = true;
+    reloadAgain = { images: images || (reloadAgain?.images ?? false) };
     return;
   }
-  reloading = loadAvatar()
+  reloading = loadAvatar(images)
     .catch((e) => overlay.error(e instanceof Error ? e.message : String(e)))
     .finally(() => {
       reloading = null;
-      if (reloadAgain) {
-        reloadAgain = false;
-        reloadAvatar();
-      }
+      const again = reloadAgain;
+      reloadAgain = null;
+      if (again) reloadAvatar(again.images);
     });
 }
 
@@ -415,7 +435,7 @@ function connect(): void {
         break;
       }
       case 'reload':
-        if (!syncMode) reloadAvatar();
+        if (!syncMode) reloadAvatar(msg.images ?? true);
         break;
       case 'meter':
         overlay.meter(msg.db, msg.voicing, msg.voiced);
