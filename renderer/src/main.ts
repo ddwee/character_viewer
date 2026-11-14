@@ -4,23 +4,31 @@
 // - 1 枚絵: 状態ごとの透過画像を切り替え、まばたきもさせる。
 //   絵が変わるときだけ描く（毎フレームは描き直さない）。OBS の負荷が軽く、ちらつきも起きにくい
 // - パーツ（avatar.json に rig があるとき）: パーツを重ね、ボーンで動かす（呼吸・頭の揺れ・髪の揺れ・口パク・まばたき）。
-//   動き続けるので毎フレーム描く。口の開き具合はエンジンから約 100 回/秒で届く音量で決める
+//   動き続けるので毎フレーム描く。口の開き具合はエンジンから約 100 回/秒で届く音量で決める。
+//   カメラを使っているときは、読み取った顔の向き・視線・表情（約 30 回/秒で届く）も反映する（rig/track.ts）
 //
 // URL のオプション
 //   ?debug    状態・接続・音量を左上に表示。キー 1〜4 で状態を手動で切り替え（発話は声のまね付き）、B でまばたき
 //   ?checker  背景を市松模様にする（ブラウザで透過を確認する用）
 //   ?sync     遅延測定用。発話中は白、それ以外は黒で全体を塗る（cv-engine --measure-av で解析する）
 //   ?engine=127.0.0.1:39540  エンジンの場所（通常は不要）
-//   ?embed    設定画面の中のプレビュー用（エンジンへ描画の応答を返さない）
+//   ?embed    設定画面の中のプレビュー用（エンジンへ描画の応答を返さない。いまの絵を PNG で渡せる）
+//   ?face=yaw:0.5,pitch:-0.2,roll:5,gx:1,gy:0,eyeL:smile,mouth:smile,expr:smile
+//             顔の向き・視線・差し替えパーツを固定する（パーツの素材の確認用）。
+//             yaw・pitch・gx・gy は -1〜1、roll は度、expr は rig.expressions の名前、ほかはスロットの値
 
-import { Application, Assets, Sprite, Texture } from 'pixi.js';
+import { Application, Assets, Container, Rectangle, Sprite, Texture } from 'pixi.js';
 import 'pixi.js/prepare';
 
 import { BlinkScheduler, type Eye } from './blink';
+import { faceSlots, type SlotValues } from './rig/face';
 import { parseRig, rigImages, type Rig } from './rig/manifest';
-import { Animator } from './rig/motion';
+import { Animator, type HeadPose } from './rig/motion';
 import { MouthController, type Mouth } from './rig/mouth';
-import { RigView } from './rig/view';
+import { loadImage, trimmedTexture } from './rig/texture';
+import { FaceTracker, type FaceMsg, type Tracked } from './rig/track';
+import { RigView, type FaceView } from './rig/view';
+import { rigFrame, unpremultiply } from './snapshot';
 
 type AvatarState = 'idle' | 'talk' | 'away' | 'sleep';
 
@@ -76,7 +84,11 @@ type ServerMsg =
   /** images が false なら変わったのは avatar.json だけ（古いエンジンは images を送らない） */
   | { type: 'reload'; images?: boolean }
   | { type: 'meter'; db: number; voicing: number; voiced: boolean }
-  | { type: 'level'; db: number };
+  | { type: 'level'; db: number }
+  /** カメラで読み取った顔 */
+  | FaceMsg
+  /** 手動で選んだ表情（rig.expressions の名前。null で解除） */
+  | { type: 'expression'; name: string | null };
 
 const PROTOCOL_VERSION = 1;
 const RECONNECT_MS = 1000;
@@ -102,6 +114,44 @@ let lastFrameAt: number | null = null;
 /** 発話をプレビュー・デバッグで試しているとき、声のまねをする（エンジンの音量の代わり） */
 let simulateVoice = false;
 let mouthShape: Mouth = 'closed';
+
+/** 顔の向き・視線・差し替えパーツの指定（?face= や設定画面から。カメラの値もここに入る） */
+interface FaceControl {
+  head?: HeadPose;
+  gaze: [number, number];
+  /** 表情（rig.expressions の名前） */
+  expression?: string;
+  /** スロットの値の上書き（表情より優先） */
+  slots: SlotValues;
+}
+
+/** "yaw:0.5,eyeL:smile" の形の指定を読む */
+function parseFace(text: string | null): FaceControl {
+  const out: FaceControl = { gaze: [0, 0], slots: {} };
+  const head: HeadPose = { yaw: 0, pitch: 0, roll: 0 };
+  for (const item of (text ?? '').split(',')) {
+    const [key, value] = item.split(':').map((v) => v.trim());
+    if (!key || value === undefined) continue;
+    const n = Number(value);
+    if (key === 'yaw' || key === 'pitch' || key === 'roll') {
+      if (Number.isFinite(n)) out.head = Object.assign(head, { [key]: n });
+    } else if (key === 'gx' || key === 'gy') {
+      if (Number.isFinite(n)) out.gaze[key === 'gx' ? 0 : 1] = n;
+    } else if (key === 'expr') out.expression = value;
+    else out.slots[key] = value;
+  }
+  return out;
+}
+
+let faceControl = parseFace(params.get('face'));
+/** カメラで読み取った顔 */
+const faceTracker = new FaceTracker();
+/** 今のフレームで使う、カメラの顔（カメラなし・顔が見つからないときは null） */
+let tracked: Tracked | null = null;
+/** 設定画面やキー操作で選んだ表情（エンジンから届く） */
+let chosenExpression: string | null = null;
+/** 最後に描いた顔（PNG で保存するときに、目だけ開けて描き直す） */
+let lastFace: FaceView | null = null;
 
 let current: AvatarState = 'idle';
 let config: DisplayConfig = { blink: true, blinkRate: 1, mirror: false };
@@ -198,14 +248,41 @@ function drawRig(now: number, av: RigAvatar): void {
   if (simulateVoice && current === 'talk') mouth.level(fakeLevel(now), now);
   mouthShape = mouth.update(now);
 
-  const prevEye = eye;
-  // 状態で目を固定するとき（寝落ちなど）は表情の絵、そうでなければ瞬き
-  const fixed = av.animator.eyesFor(current);
-  eye = fixed ?? (blinksIn(current) ? blink.update(now, av.view.hasHalfEyes) : 'open');
-  if (prevEye === 'open' && eye !== 'open' && !fixed) stats.blinks++;
+  tracked = faceTracker.current(now);
+  const state = poseState();
 
-  av.animator.update({ t: now / 1000, dt, state: current, mouth: current === 'talk' ? mouth.amount : 0 });
-  av.view.update(av.animator.skeleton, mouthShape, eye, fixed === undefined);
+  const prevEye = eye;
+  // 状態で目を固定するとき（寝落ちなど）は表情の絵、そうでなければ瞬き。カメラで目を読み取っているときは、本人の瞬きに任せる
+  const fixed = av.animator.eyesFor(state);
+  eye = !fixed && !tracked?.eyes && blinksIn(state) ? blink.update(now, av.view.hasHalfEyes) : 'open';
+  if (prevEye === 'open' && eye !== 'open') stats.blinks++;
+
+  av.animator.update({ t: now / 1000, dt, state, mouth: current === 'talk' ? mouth.amount : 0, head: faceControl.head ?? tracked?.head });
+  lastFace = faceView(av, eye);
+  av.view.update(av.animator.skeleton, lastFace);
+}
+
+/**
+ * 姿勢に使う状態。カメラに顔が映っている間は、黙っていても「放置」「寝落ち」の姿勢にしない
+ * （本人が起きて画面を見ているのに、キャラクターだけ寝てしまわないように）
+ */
+function poseState(): AvatarState {
+  return tracked && (current === 'away' || current === 'sleep') ? 'idle' : current;
+}
+
+/** 今の顔（スロットの値・向き・視線）。`eyeNow` は瞬きの状態 */
+function faceView(av: RigAvatar, eyeNow: Eye): FaceView {
+  // 優先順: カメラの表情 < 選んだ表情（設定画面・キー操作）< ?face= の指定
+  const expression = faceControl.expression ?? chosenExpression ?? undefined;
+  const overrides = { ...tracked?.overrides, ...(expression ? av.rig.expressions[expression] : undefined), ...faceControl.slots };
+  // 声が出ていないときは、カメラで見た口の開きを使う（あくび、驚いて口を開ける、など）
+  const mouthNow = mouthShape === 'closed' && tracked ? tracked.mouthOpen : mouthShape;
+  const slots = faceSlots(
+    { mouth: mouthNow, eye: eyeNow, fixedEyes: av.animator.eyesFor(poseState()), overrides, mouthForm: tracked?.mouthForm },
+    av.view.vocab.get('mouth'),
+  );
+  const manualGaze = faceControl.gaze[0] !== 0 || faceControl.gaze[1] !== 0;
+  return { slots, turn: av.animator.turn, gaze: manualGaze ? faceControl.gaze : (tracked?.gaze ?? faceControl.gaze) };
 }
 
 function frame(now: number): void {
@@ -234,6 +311,66 @@ function frame(now: number): void {
     if (wakeAt <= now) requestFrame();
     else wakeTimer = setTimeout(requestFrame, wakeAt - now);
   }
+}
+
+/**
+ * いまの絵を、素材の解像度（拡大・縮小なし）の透過 PNG にする（設定画面の「PNG で保存」）。
+ * 左右反転は OBS の表示と同じにかける。瞬きの途中なら目を開けた絵で写す（サムネイル用なので）
+ */
+async function snapshot(): Promise<Blob> {
+  if (syncMode) throw new Error('遅延測定の表示では保存できません');
+  const wrap = new Container();
+  const flip = config.mirror ? -1 : 1;
+  let frame: Rectangle;
+  let restore: () => void;
+
+  if (rigAvatar) {
+    const { view, animator } = rigAvatar;
+    const [w, h] = view.size;
+    if (eye !== 'open' && lastFace) view.update(animator.skeleton, faceView(rigAvatar, 'open'));
+    // 画面用の配置（縮小・下端中央）を外して、画像の座標のまま写す。終わったら元の場所に戻す
+    const root = view.root;
+    const parent = root.parent;
+    const index = parent ? parent.getChildIndex(root) : 0;
+    root.pivot.set(0, 0);
+    root.scale.set(flip, 1);
+    root.position.set(config.mirror ? w : 0, 0);
+    wrap.addChild(root);
+    const f = rigFrame(w, h, RIG_MARGIN);
+    frame = new Rectangle(f.x, f.y, f.width, f.height);
+    restore = () => {
+      parent?.addChildAt(root, index);
+      layout();
+    };
+  } else {
+    const tex = lookFor(current).open;
+    if (tex.width <= 1 || tex.height <= 1) throw new Error('絵がまだ読み込まれていません');
+    const s = new Sprite(tex);
+    s.scale.set(flip, 1);
+    s.position.set(config.mirror ? tex.width : 0, 0);
+    wrap.addChild(s);
+    frame = new Rectangle(0, 0, tex.width, tex.height);
+    restore = () => s.destroy();
+  }
+
+  let image: ImageData;
+  try {
+    const { pixels, width, height } = app.renderer.extract.pixels({ target: wrap, frame, resolution: 1 });
+    unpremultiply(pixels);
+    image = new ImageData(pixels as Uint8ClampedArray<ArrayBuffer>, width, height);
+  } finally {
+    restore();
+    wrap.destroy();
+    requestFrame();
+  }
+
+  const canvas = document.createElement('canvas');
+  canvas.width = image.width;
+  canvas.height = image.height;
+  canvas.getContext('2d')!.putImageData(image, 0, 0);
+  return new Promise((resolve, reject) =>
+    canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('PNG にできませんでした'))), 'image/png'),
+  );
 }
 
 /** 状態を変える。`simulated` はプレビュー・デバッグで試すとき（発話なら声のまねをする） */
@@ -286,7 +423,8 @@ async function loadRig(raw: unknown, reuse?: Map<string, Texture>): Promise<RigA
   await Promise.all(
     files.map(async (f) => {
       let t = reuse?.get(f);
-      if (!t) fresh.push((t = await loadTexture(f)));
+      // パーツは透明な余白を切り詰めて GPU に送る（rig/texture.ts）
+      if (!t) fresh.push((t = trimmedTexture(await loadImage(`avatar/${encodeURI(f)}?v=${avatarVersion}`))));
       textures.set(f, t);
     }),
   );
@@ -406,7 +544,7 @@ function connect(): void {
     clearTimeout(disconnectTimer);
     if (!embed) sendAck = (seq) => send({ type: 'ack', seq });
     overlay.connected(true);
-    subscribe = () => send({ type: 'subscribe', meter: debug, level: rigAvatar !== null });
+    subscribe = () => send({ type: 'subscribe', meter: debug, level: rigAvatar !== null, face: rigAvatar !== null });
     if (debug || rigAvatar) subscribe();
   };
 
@@ -443,6 +581,12 @@ function connect(): void {
       case 'level':
         if (!simulateVoice) mouth.level(msg.db, performance.now());
         break;
+      case 'face':
+        faceTracker.update(msg, performance.now());
+        break;
+      case 'expression':
+        chosenExpression = msg.name;
+        break;
     }
   };
 
@@ -472,6 +616,7 @@ const overlay = (() => {
     el.textContent = [
       `接続 : ${conn ? '○ エンジンと接続中' : '× 未接続（再接続を試行中）'}`,
       `状態 : ${LABELS[current]}（${current}）${rigAvatar ? `  口 ${mouthShape} / 目 ${eye}` : ''}`,
+      rigAvatar ? `カメラ: ${tracked ? `向き ${tracked.head.yaw.toFixed(2)} / ${tracked.head.pitch.toFixed(2)} / 傾き ${tracked.head.roll.toFixed(0)}°  ${JSON.stringify(tracked.overrides)}` : '読み取っていません'}${chosenExpression ? `  表情 ${chosenExpression}` : ''}` : '',
       level,
       `回数 : 切替 ${stats.changes} / 再接続 ${stats.reconnects} / まばたき ${stats.blinks} / 描画 ${stats.renders}`,
       'キー 1〜4 で状態を切り替え（発話は声のまね付き）、B でまばたき',
@@ -558,11 +703,21 @@ async function main(): Promise<void> {
   if (embed) {
     window.addEventListener('message', (e: MessageEvent) => {
       if (e.origin !== location.origin) return;
-      const m = e.data as { type?: string; state?: AvatarState };
+      const m = e.data as { type?: string; state?: AvatarState; id?: number };
       if (m.type === 'preview-state' && m.state && STATES.includes(m.state)) show(m.state, true);
+      // 顔の向き・表情を試す（"yaw:0.5,expr:smile" の形。空文字で解除）
+      if (m.type === 'preview-face') faceControl = parseFace((m as { face?: string }).face ?? '');
       if (m.type === 'preview-blink') {
         blink.blinkNow(performance.now());
         requestFrame();
+      }
+      if (m.type === 'snapshot') {
+        const reply = (r: object) => (e.source as Window | null)?.postMessage({ type: 'snapshot-result', id: m.id, ...r }, e.origin);
+        const state = current;
+        snapshot().then(
+          (png) => reply({ png, state }),
+          (err: unknown) => reply({ error: err instanceof Error ? err.message : String(err) }),
+        );
       }
     });
   }

@@ -26,6 +26,7 @@ use crate::maintenance::{self, UpdateOptions};
 use crate::recording;
 use crate::runtime::RuntimeHandle;
 use crate::settings::Settings;
+use crate::snapshot;
 
 pub struct ApiState {
     pub rt: RuntimeHandle,
@@ -42,6 +43,8 @@ pub struct ApiState {
     pub app_exe: Option<PathBuf>,
     /// アプリを終了させる（アプリとして動いているときだけ）
     pub quit: Option<Box<dyn Fn() + Send + Sync>>,
+    /// カメラの映像のウィンドウを表示する / 隠す（アプリとして動いているときだけ）
+    pub camera_window: Option<Box<dyn Fn(bool) + Send + Sync>>,
     pub jobs: Arc<Jobs>,
 }
 
@@ -77,6 +80,10 @@ pub fn routes(state: Arc<ApiState>) -> Router {
             put(avatar_put).layer(DefaultBodyLimit::max(avatar_files::MAX_BYTES + 1024)),
         )
         .route("/api/avatar/{state}/{slot}", delete(avatar_delete))
+        .route(
+            "/api/snapshot",
+            put(snapshot_put).layer(DefaultBodyLimit::max(snapshot::MAX_BYTES + 1024)),
+        )
         .route("/api/recordings", get(recordings))
         .route("/api/measure", post(measure))
         .route("/api/jobs/{id}", get(job))
@@ -94,6 +101,8 @@ pub fn routes(state: Arc<ApiState>) -> Router {
             get(get_autostart).put(put_autostart),
         )
         .route("/api/app/quit", post(quit))
+        .route("/api/expression", get(get_expression).post(set_expression))
+        .route("/api/camera/window", post(camera_window))
         .layer(middleware::from_fn(move |req, next| guard(port, req, next)))
         .with_state(state)
 }
@@ -199,6 +208,15 @@ async fn reset_settings(State(st): S, Json(req): Json<ResetReq>) -> Response {
             s.avatar.dir = dir;
         }
         Some("display") => s.display = d.display,
+        Some("camera") => {
+            // カメラを使うかどうか、カメラの選択、測った値（基準・表情の大きさ）は残す
+            let c = std::mem::replace(&mut s.camera, d.camera);
+            s.camera.enabled = c.enabled;
+            s.camera.device = c.device;
+            s.camera.neutral = c.neutral;
+            s.camera.ranges = c.ranges;
+        }
+        Some("hotkeys") => s.hotkeys = d.hotkeys,
         Some("server") => s.server = d.server,
         None => s = d,
         Some(other) => return bad(format!("不明な項目です: {other}")),
@@ -289,6 +307,24 @@ async fn avatar_delete(
             ok()
         }
         Err(e) => bad(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct SnapshotQuery {
+    /// ファイル名に付ける状態の名前（idle など）
+    state: Option<String>,
+}
+
+/// いまの絵（描画ページが作った透過 PNG）を「ピクチャ」に保存する
+async fn snapshot_put(Query(q): Query<SnapshotQuery>, body: Bytes) -> Response {
+    match tokio::task::spawn_blocking(move || snapshot::save(&body, q.state.as_deref())).await {
+        Ok(Ok(path)) => {
+            log::info!("いまの絵を保存しました: {}", path.display());
+            Json(json!({ "path": path })).into_response()
+        }
+        Ok(Err(e)) => bad(e),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
 
@@ -399,7 +435,7 @@ async fn install_ffmpeg(State(st): S) -> Response {
 
 #[derive(Deserialize)]
 struct OpenReq {
-    /// settings / logs / avatar / project / recordings / file
+    /// settings / logs / avatar / project / snapshots / file
     target: String,
     path: Option<PathBuf>,
 }
@@ -410,6 +446,7 @@ async fn open_folder(State(st): S, Json(req): Json<OpenReq>) -> Response {
         "logs" => crate::logging::log_dir(),
         "avatar" => Some(avatar_dir(&st)),
         "project" => Some(st.root.clone()),
+        "snapshots" => Some(snapshot::dir()),
         // 録画ファイルの場所（ファイルならそのフォルダ）
         "file" => req.path.and_then(|p| {
             if p.is_dir() {
@@ -446,6 +483,46 @@ async fn put_autostart(State(st): S, Json(req): Json<AutostartReq>) -> Response 
     match tokio::task::spawn_blocking(move || maintenance::set_autostart(req.enabled, &exe)).await {
         Ok(r) => result(r),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct ExpressionReq {
+    /// rig.expressions の名前。None で解除
+    name: Option<String>,
+}
+
+async fn get_expression(State(st): S) -> Response {
+    Json(json!({ "name": st.rt.hub.expression(), "trackers": st.rt.hub.trackers() }))
+        .into_response()
+}
+
+async fn set_expression(State(st): S, Json(req): Json<ExpressionReq>) -> Response {
+    if req
+        .name
+        .as_ref()
+        .is_some_and(|n| n.is_empty() || n.len() > 64)
+    {
+        return bad("表情の名前が正しくありません");
+    }
+    st.rt.hub.publish_expression(req.name);
+    ok()
+}
+
+#[derive(Deserialize)]
+struct CameraWindowReq {
+    show: bool,
+}
+
+async fn camera_window(State(st): S, Json(req): Json<CameraWindowReq>) -> Response {
+    match &st.camera_window {
+        Some(f) => {
+            f(req.show);
+            ok()
+        }
+        None => bad(
+            "アプリとして起動しているときだけ使えます（ブラウザでは /tracker/ を開いてください）",
+        ),
     }
 }
 

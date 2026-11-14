@@ -125,6 +125,7 @@ fn main() -> Result<()> {
     let seconds = args.seconds;
     let a = args;
     let service = service::start(service::Options {
+        camera_window: None,
         root: None,
         app_exe: None,
         quit: None,

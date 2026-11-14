@@ -75,13 +75,26 @@ pub enum ClientEvent {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum Outgoing {
-    Hello { version: u32 },
+    Hello {
+        version: u32,
+    },
     State(StateMsg),
     Config(DisplaySettings),
-    Reload { images: bool },
+    Reload {
+        images: bool,
+    },
     Meter(MeterMsg),
-    Level { db: f32 },
+    Level {
+        db: f32,
+    },
+    /// 手動で選んだ表情（rig.expressions の名前。None で解除）
+    Expression {
+        name: Option<String>,
+    },
 }
+
+/// カメラで読み取った顔（tracker ページから届いた JSON をそのまま表示側へ流す）の大きさの上限
+const MAX_FACE_BYTES: usize = 2048;
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -94,6 +107,9 @@ enum Incoming {
         meter: bool,
         #[serde(default)]
         level: bool,
+        /// カメラで読み取った顔（パーツで動かす素材のときだけ要る）
+        #[serde(default)]
+        face: bool,
     },
 }
 
@@ -107,8 +123,14 @@ pub struct Hub {
     /// 読み込み直しの通し番号（何でも / 画像も読み直すもの）。
     /// watch は最新の値しか届かないので、画像の読み直しは別の番号で数えて取りこぼさないようにする
     reload: watch::Sender<(u64, u64)>,
+    /// カメラで読み取った顔（tracker ページが送ってきた JSON のまま。約 30 回/秒）
+    face: watch::Sender<Arc<str>>,
+    /// 手動で選んだ表情
+    expression: watch::Sender<Option<String>>,
     seq: AtomicU64,
     clients: AtomicUsize,
+    /// 接続中の tracker ページ（カメラの読み取り）の数
+    trackers: AtomicUsize,
     events: mpsc::Sender<ClientEvent>,
     /// イラスト素材のフォルダ（実行中に切り替えられる）
     avatar_dir: RwLock<PathBuf>,
@@ -129,8 +151,11 @@ impl Hub {
             level: watch::Sender::new(-120.0),
             config: watch::Sender::new(display),
             reload: watch::Sender::new((0, 0)),
+            face: watch::Sender::new(Arc::from("")),
+            expression: watch::Sender::new(None),
             seq: AtomicU64::new(0),
             clients: AtomicUsize::new(0),
+            trackers: AtomicUsize::new(0),
             events,
             avatar_dir: RwLock::new(avatar_dir),
         });
@@ -192,6 +217,24 @@ impl Hub {
             drop(cur);
             self.reload_avatar();
         }
+    }
+
+    /// 手動で表情を選ぶ（None で解除）
+    pub fn publish_expression(&self, name: Option<String>) {
+        self.expression.send_if_modified(|cur| {
+            let changed = *cur != name;
+            *cur = name;
+            changed
+        });
+    }
+
+    pub fn expression(&self) -> Option<String> {
+        self.expression.borrow().clone()
+    }
+
+    /// 接続中の tracker ページ（カメラの読み取り）の数
+    pub fn trackers(&self) -> usize {
+        self.trackers.load(Ordering::Relaxed)
     }
 
     /// 接続中の表示側の数
@@ -281,8 +324,42 @@ async fn ws_handler(
     Query(q): Query<WsQuery>,
     State(hub): State<Arc<Hub>>,
 ) -> Response {
-    let monitor = q.role.as_deref() == Some("monitor");
-    ws.on_upgrade(move |socket| client(socket, hub, monitor))
+    let role = match q.role.as_deref() {
+        Some("monitor") => Role::Monitor,
+        Some("tracker") => Role::Tracker,
+        _ => Role::Display,
+    };
+    ws.on_upgrade(move |socket| client(socket, hub, role))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// OBS などの表示
+    Display,
+    /// 設定画面のプレビューなど（表示側として数えない）
+    Monitor,
+    /// カメラの読み取り（顔の値を送ってくる）
+    Tracker,
+}
+
+struct TrackerCount<'a>(&'a Hub);
+
+impl<'a> TrackerCount<'a> {
+    fn enter(hub: &'a Hub) -> Self {
+        hub.trackers.fetch_add(1, Ordering::Relaxed);
+        Self(hub)
+    }
+}
+
+impl Drop for TrackerCount<'_> {
+    fn drop(&mut self) {
+        self.0.trackers.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// tracker ページから届いた顔の値か（形だけ確かめる。中身は表示側が検査する）
+fn is_face_message(text: &str) -> bool {
+    text.len() <= MAX_FACE_BYTES && text.starts_with(r#"{"type":"face""#) && text.ends_with('}')
 }
 
 struct ClientCount<'a>(&'a Hub);
@@ -307,8 +384,13 @@ async fn send(socket: &mut WebSocket, msg: &Outgoing) -> bool {
     socket.send(Message::text(text)).await.is_ok()
 }
 
-async fn client(mut socket: WebSocket, hub: Arc<Hub>, monitor: bool) {
+async fn client(mut socket: WebSocket, hub: Arc<Hub>, role: Role) {
+    let monitor = role != Role::Display;
     let _count = (!monitor).then(|| ClientCount::enter(&hub));
+    let _tracker = (role == Role::Tracker).then(|| TrackerCount::enter(&hub));
+    let mut face_rx = hub.face.subscribe();
+    let mut expression_rx = hub.expression.subscribe();
+    let mut want_face = false;
     let mut state_rx = hub.state.subscribe();
     let mut meter_rx = hub.meter.subscribe();
     let mut level_rx = hub.level.subscribe();
@@ -332,6 +414,11 @@ async fn client(mut socket: WebSocket, hub: Arc<Hub>, monitor: bool) {
     {
         return;
     }
+    let expression = expression_rx.borrow_and_update().clone();
+    if expression.is_some() && !send(&mut socket, &Outgoing::Expression { name: expression }).await
+    {
+        return;
+    }
 
     loop {
         let msg = tokio::select! {
@@ -343,17 +430,24 @@ async fn client(mut socket: WebSocket, hub: Arc<Hub>, monitor: bool) {
             },
             incoming = socket.recv() => {
                 match incoming {
+                    Some(Ok(Message::Text(text))) if role == Role::Tracker && is_face_message(&text) => {
+                        hub.face.send_replace(Arc::from(text.as_str()));
+                    }
                     Some(Ok(Message::Text(text))) => match serde_json::from_str::<Incoming>(&text) {
                         Ok(Incoming::Ack { seq }) if !monitor => {
                             let _ = hub.events.send(ClientEvent::Ack { seq, at: Instant::now() });
                         }
-                        Ok(Incoming::Subscribe { meter, level }) => {
+                        Ok(Incoming::Subscribe { meter, level, face }) => {
                             want_meter = meter;
                             if level && !want_level {
                                 // 購読前の古い値は送らない
                                 level_rx.borrow_and_update();
                             }
                             want_level = level;
+                            if face && !want_face {
+                                face_rx.borrow_and_update();
+                            }
+                            want_face = face;
                         }
                         _ => {}
                     },
@@ -372,6 +466,21 @@ async fn client(mut socket: WebSocket, hub: Arc<Hub>, monitor: bool) {
                     let msg = Outgoing::Reload { images: images != images_seen };
                     images_seen = images;
                     msg
+                }
+                Err(_) => break,
+            },
+            changed = expression_rx.changed() => match changed {
+                Ok(()) => Outgoing::Expression { name: expression_rx.borrow_and_update().clone() },
+                Err(_) => break,
+            },
+            // 顔の値は届いた JSON のまま流す（作り直さない）
+            changed = face_rx.changed(), if want_face => match changed {
+                Ok(()) => {
+                    let text = face_rx.borrow_and_update().clone();
+                    if socket.send(Message::text(&*text)).await.is_err() {
+                        break;
+                    }
+                    continue;
                 }
                 Err(_) => break,
             },
@@ -402,7 +511,8 @@ mod tests {
             m,
             Incoming::Subscribe {
                 meter: true,
-                level: false
+                level: false,
+                face: false
             }
         ));
         let m: Incoming = serde_json::from_str(r#"{"type":"subscribe","level":true}"#).unwrap();
@@ -410,9 +520,30 @@ mod tests {
             m,
             Incoming::Subscribe {
                 meter: false,
-                level: true
+                level: true,
+                face: false
             }
         ));
+    }
+
+    #[test]
+    fn face_and_expression_messages() {
+        assert!(is_face_message(r#"{"type":"face","ok":true,"yaw":0.1}"#));
+        assert!(!is_face_message(r#"{"type":"ack","seq":1}"#));
+        assert!(!is_face_message(&format!(
+            r#"{{"type":"face","x":"{}"}}"#,
+            "a".repeat(MAX_FACE_BYTES)
+        )));
+        let text = serde_json::to_string(&Outgoing::Expression {
+            name: Some("smile".into()),
+        })
+        .unwrap();
+        assert_eq!(text, r#"{"type":"expression","name":"smile"}"#);
+        let (hub, _rx) = Hub::new(DisplaySettings::default(), PathBuf::new());
+        hub.publish_expression(Some("smile".into()));
+        assert_eq!(hub.expression().as_deref(), Some("smile"));
+        hub.publish_expression(None);
+        assert_eq!(hub.expression(), None);
     }
 
     #[test]

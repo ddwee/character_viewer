@@ -1,17 +1,22 @@
-// パーツの調整画面のキャンバス（2D canvas）。
-// OBS の表示と同じ動きの計算（Animator）でパーツを描き、回転の中心（●）と揺れものの先端（■）を重ねて、
-// ドラッグで動かせるようにする。
+// パーツの調整画面のキャンバス。
+// パーツは OBS の表示と同じもの（Animator の動きを RigView で描く。PixiJS / WebGL）で描き、
+// その上に重ねた 2D canvas に、回転の中心（●）・揺れものの先端（■）・しなるパーツの網を描いて、ドラッグで動かせるようにする。
 //
 // - 調整モード: 呼吸などは止め、選んだボーンを回転の中心で揺らして見せる（揺れものなら親を揺らして、遅れ方を見せる）
 // - 動きを見るモード: OBS と同じ動き。「喋るまね」で口と頭の動きも試せる
 
+import { Application, type Texture } from 'pixi.js';
+
 import { BlinkScheduler, type Eye } from '../blink';
 import { apply, type Vec } from '../rig/bones';
 import { fit, invert, toImage, toScreen, type Fit } from '../rig/edit';
-import { blinkFrames, eyeFile, mouthFile, rigImages, type Rig, type RigLayer } from '../rig/manifest';
-import { Animator } from '../rig/motion';
+import { faceSlots, type SlotValues } from '../rig/face';
+import { rigImages, type Rig } from '../rig/manifest';
+import { Animator, type HeadPose } from '../rig/motion';
 import { MouthController, type Mouth } from '../rig/mouth';
 import { TipSpring } from '../rig/spring';
+import { trimmedTexture } from '../rig/texture';
+import { RigView, type FaceView, type MeshLines } from '../rig/view';
 
 export type CanvasMode = 'adjust' | 'play';
 
@@ -23,6 +28,18 @@ export interface Mask {
   iw: number;
   ih: number;
   alpha: Uint8ClampedArray;
+}
+
+/** 動きを見るモードで試す、顔の向き・視線・差し替えパーツ */
+export interface FaceTest {
+  /** 顔の向き（指定しなければ自動のゆらぎ） */
+  head?: HeadPose;
+  /** 視線（-1〜1） */
+  gaze: Vec;
+  /** 表情（rig.expressions の名前） */
+  expression?: string;
+  /** スロットの値の上書き */
+  slots: SlotValues;
 }
 
 export interface CanvasProps {
@@ -37,6 +54,10 @@ export interface CanvasProps {
   dim: boolean;
   /** 動きを見るモードで、喋るまねをする */
   talking: boolean;
+  /** しなるパーツの網を表示する */
+  showMesh: boolean;
+  /** 動きを見るモードで試す顔 */
+  face?: FaceTest;
   onSelect: (bone: string) => void;
   /** 回転の中心をドラッグした（`done` はドラッグを離したとき） */
   onPivot: (bone: string, pivot: Vec, done: boolean) => void;
@@ -81,8 +102,16 @@ function fakeLevel(now: number): number {
 }
 
 export class RigCanvas {
+  /** 上に重ねる 2D canvas（点と網を描き、マウスを受け取る） */
   private readonly canvas: HTMLCanvasElement;
   private readonly ctx: CanvasRenderingContext2D;
+  private readonly app = new Application();
+  private ready = false;
+  private destroyed = false;
+  private textures = new Map<string, Texture>();
+  private texturesFor: Map<string, HTMLImageElement> | null = null;
+  private rigView: RigView | null = null;
+  private rigViewFor: Rig | null = null;
   private props: CanvasProps;
   private animator: Animator;
   private readonly mouth = new MouthController();
@@ -95,6 +124,7 @@ export class RigCanvas {
   private view: Fit = { scale: 1, ox: 0, oy: 0 };
   private readonly resize: ResizeObserver;
 
+  /** `canvas` は重ねる 2D canvas。PixiJS の canvas はその直前（下）に入れる */
   constructor(canvas: HTMLCanvasElement, props: CanvasProps) {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d')!;
@@ -102,6 +132,16 @@ export class RigCanvas {
     this.animator = new Animator(props.rig);
     this.resize = new ResizeObserver(() => this.fitCanvas());
     this.resize.observe(canvas);
+    this.app
+      .init({ autoStart: false, backgroundAlpha: 0, antialias: true, autoDensity: true, resolution: window.devicePixelRatio || 1, preference: 'webgl' })
+      .then(() => {
+        if (this.destroyed) return this.app.destroy(true);
+        this.app.ticker.stop();
+        this.app.canvas.classList.add('rig-gl');
+        canvas.parentElement!.insertBefore(this.app.canvas, canvas);
+        this.ready = true;
+        this.fitCanvas();
+      });
     this.fitCanvas();
     canvas.addEventListener('pointerdown', this.onDown);
     canvas.addEventListener('pointermove', this.onMove);
@@ -117,8 +157,12 @@ export class RigCanvas {
   }
 
   destroy(): void {
+    this.destroyed = true;
     cancelAnimationFrame(this.raf);
     this.resize.disconnect();
+    this.rigView?.destroy();
+    for (const t of this.textures.values()) t.destroy(true);
+    if (this.ready) this.app.destroy(true);
     this.canvas.removeEventListener('pointerdown', this.onDown);
     this.canvas.removeEventListener('pointermove', this.onMove);
     this.canvas.removeEventListener('pointerup', this.onUp);
@@ -131,6 +175,26 @@ export class RigCanvas {
     const h = this.canvas.clientHeight;
     this.canvas.width = Math.max(1, Math.round(w * dpr));
     this.canvas.height = Math.max(1, Math.round(h * dpr));
+    if (this.ready) this.app.renderer.resize(w, h);
+  }
+
+  /** 画像・rig が変わったら、テクスチャと RigView を作り直す */
+  private ensureView(): RigView | null {
+    const p = this.props;
+    if (this.texturesFor !== p.images) {
+      this.rigView?.destroy();
+      this.rigView = null;
+      for (const t of this.textures.values()) t.destroy(true);
+      this.textures = new Map([...p.images].map(([f, img]) => [f, trimmedTexture(img)]));
+      this.texturesFor = p.images;
+    }
+    if (this.rigViewFor !== p.rig || !this.rigView) {
+      this.rigView?.destroy();
+      this.rigView = new RigView(p.rig, this.textures);
+      this.rigViewFor = p.rig;
+      this.app.stage.addChild(this.rigView.root);
+    }
+    return this.rigView;
   }
 
   // ───── 毎フレーム ─────
@@ -147,14 +211,14 @@ export class RigCanvas {
     if (talking) this.mouth.level(fakeLevel(now), now);
     this.mouthShape = this.mouth.update(now);
     this.blink.setTalking(talking);
-    const hasHalf = p.rig.layers.every((l) => l.kind !== 'eyes' || blinkFrames(l).half !== undefined);
-    this.eye = playing ? this.blink.update(now, hasHalf) : 'open';
+    this.eye = playing && this.rigView?.canBlink ? this.blink.update(now, this.rigView.hasHalfEyes) : 'open';
 
     this.animator.update({
       t: now / 1000,
       dt,
       state: talking ? 'talk' : 'idle',
       mouth: talking ? this.mouth.amount : 0,
+      head: playing ? p.face?.head : undefined,
       still: !playing,
       adjust: playing || this.drag || !p.wiggle ? undefined : (sk) => this.wiggle(sk, now),
     });
@@ -171,10 +235,13 @@ export class RigCanvas {
     if (pose) pose.rotation += ((WIGGLE_DEG * Math.PI) / 180) * Math.sin((2 * Math.PI * now) / 1000 / WIGGLE_SECS);
   }
 
-  private fileFor(layer: RigLayer): string {
-    if (layer.kind === 'image') return layer.image;
-    if (layer.kind === 'mouth') return mouthFile(layer, this.mouthShape);
-    return eyeFile(layer, this.eye, true);
+  /** 今の顔（調整モードでは、素の顔のまま） */
+  private faceView(rv: RigView): FaceView {
+    const p = this.props;
+    const test = p.mode === 'play' ? p.face : undefined;
+    const overrides = { ...(test?.expression ? p.rig.expressions[test.expression] : undefined), ...test?.slots };
+    const slots = faceSlots({ mouth: this.mouthShape, eye: this.eye, overrides }, rv.vocab.get('mouth'));
+    return { slots, turn: this.animator.turn, gaze: test?.gaze ?? [0, 0] };
   }
 
   private size(): Vec {
@@ -194,23 +261,73 @@ export class RigCanvas {
     const v = this.view;
     const sk = this.animator.skeleton;
 
+    // パーツ（OBS と同じ RigView で描く）
+    if (this.ready) {
+      const rv = this.ensureView();
+      if (rv) {
+        rv.root.scale.set(v.scale);
+        rv.root.position.set(v.ox, v.oy);
+        rv.setAlpha((layer) => (p.dim && p.mode === 'adjust' && layer.bone !== p.selected ? 0.35 : 1));
+        rv.update(sk, this.faceView(rv));
+        this.app.render();
+      }
+    }
+
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.imageSmoothingQuality = 'high';
-
-    // パーツ
-    for (const layer of p.rig.layers) {
-      const img = p.images.get(this.fileFor(layer));
-      const m = sk.sprite.get(layer.bone);
-      if (!img || !m) continue;
-      ctx.setTransform(dpr * v.scale, 0, 0, dpr * v.scale, dpr * v.ox, dpr * v.oy);
-      ctx.transform(m.a, m.b, m.c, m.d, m.tx, m.ty);
-      ctx.globalAlpha = p.dim && p.mode === 'adjust' && layer.bone !== p.selected ? 0.35 : 1;
-      ctx.drawImage(img, 0, 0);
-    }
-    ctx.globalAlpha = 1;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    if (p.showMesh) this.drawMesh();
     if (p.mode === 'adjust') this.drawHandles();
+  }
+
+  /** 網の三角形のうち、絵がある（透明でない）もの。網ごとに 1 回だけ調べる */
+  private readonly visibleTris = new WeakMap<Float32Array, Uint32Array>();
+
+  private trianglesWithContent(m: MeshLines): Uint32Array {
+    const cached = this.visibleTris.get(m.rest);
+    if (cached) return cached;
+    const mask = this.props.masks.get(m.image);
+    const keep: number[] = [];
+    for (let t = 0; t < m.indices.length; t += 3) {
+      const vs = [m.indices[t], m.indices[t + 1], m.indices[t + 2]];
+      if (!mask) {
+        keep.push(...vs);
+        continue;
+      }
+      // 三角形を囲む範囲に、透明でない点があるか（縮小した不透明度で調べる）
+      const xs = vs.map((v) => (m.rest[v * 2] * mask.w) / mask.iw);
+      const ys = vs.map((v) => (m.rest[v * 2 + 1] * mask.h) / mask.ih);
+      const [x0, x1] = [Math.max(0, Math.floor(Math.min(...xs))), Math.min(mask.w - 1, Math.ceil(Math.max(...xs)))];
+      const [y0, y1] = [Math.max(0, Math.floor(Math.min(...ys))), Math.min(mask.h - 1, Math.ceil(Math.max(...ys)))];
+      let found = false;
+      for (let y = y0; y <= y1 && !found; y++) for (let x = x0; x <= x1 && !found; x++) found = mask.alpha[y * mask.w + x] > 20;
+      if (found) keep.push(...vs);
+    }
+    const out = new Uint32Array(keep);
+    this.visibleTris.set(m.rest, out);
+    return out;
+  }
+
+  /** 選んだボーンのしなるパーツの網（絵がある部分だけ） */
+  private drawMesh(): void {
+    const { ctx } = this;
+    const p = this.props;
+    for (const m of this.rigView?.meshLines() ?? []) {
+      if (m.bone !== p.selected) continue;
+      ctx.strokeStyle = 'rgb(255 80 160 / 0.75)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      const pt = (i: number) => toScreen(this.view, [m.positions[i * 2], m.positions[i * 2 + 1]]);
+      const tris = this.trianglesWithContent(m);
+      for (let t = 0; t < tris.length; t += 3) {
+        const [a, b, c] = [pt(tris[t]), pt(tris[t + 1]), pt(tris[t + 2])];
+        ctx.moveTo(a[0], a[1]);
+        ctx.lineTo(b[0], b[1]);
+        ctx.lineTo(c[0], c[1]);
+        ctx.closePath();
+      }
+      ctx.stroke();
+    }
   }
 
   private drawHandles(): void {
@@ -300,12 +417,12 @@ export class RigCanvas {
   /** 画面の点にあるパーツのボーン（上に重なっているものから） */
   private pick(sx: number, sy: number): string | null {
     const p = this.props;
-    const sk = this.animator.skeleton;
     const pt = toImage(this.view, [sx, sy]);
-    for (let i = p.rig.layers.length - 1; i >= 0; i--) {
-      const layer = p.rig.layers[i];
-      const mask = p.masks.get(this.fileFor(layer));
-      const inv = invert(sk.sprite.get(layer.bone)!);
+    const shown = this.rigView?.shown() ?? [];
+    for (let i = shown.length - 1; i >= 0; i--) {
+      const { layer, file, mat } = shown[i];
+      const mask = p.masks.get(file);
+      const inv = invert(mat);
       if (!mask || !inv) continue;
       const [x, y] = apply(inv, pt);
       const mx = Math.floor((x * mask.w) / mask.iw);

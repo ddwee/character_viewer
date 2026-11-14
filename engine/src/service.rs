@@ -19,6 +19,8 @@ pub struct Options {
     pub app_exe: Option<PathBuf>,
     /// アプリを終了させる処理
     pub quit: Option<Box<dyn Fn() + Send + Sync>>,
+    /// カメラの映像のウィンドウを表示する / 隠す処理
+    pub camera_window: Option<Box<dyn Fn(bool) + Send + Sync>>,
     /// 起動時だけ設定を上書きする（コマンド版のオプション。保存はしない）
     pub overrides: Option<Box<dyn FnOnce(&mut Settings)>>,
 }
@@ -32,6 +34,10 @@ pub struct Service {
 impl Service {
     pub fn settings_url(&self) -> String {
         format!("http://127.0.0.1:{}/settings/", self.port)
+    }
+    /// カメラの読み取りページ
+    pub fn tracker_url(&self) -> String {
+        format!("http://127.0.0.1:{}/tracker/", self.port)
     }
     pub fn obs_url(&self) -> String {
         format!("http://127.0.0.1:{}/", self.port)
@@ -116,6 +122,7 @@ pub fn start(opts: Options) -> Result<Service> {
         notices: Mutex::new(notices),
         app_exe: opts.app_exe,
         quit: opts.quit,
+        camera_window: opts.camera_window,
         jobs: Arc::new(Jobs::default()),
     });
     let app = server::routes(hub, renderer).merge(api::routes(api.clone()));

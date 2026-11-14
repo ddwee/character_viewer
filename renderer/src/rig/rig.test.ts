@@ -196,6 +196,7 @@ test('rig を読み、書かれていない値は既定値で補う', () => {
   assert.equal(rig.states.away.eyes, 'half');
   assert.equal(rig.states.idle.eyes, undefined);
   assert.equal(rigImages(rig).length, 10);
+  assert.deepEqual(rig.motion.turn, { x: 40, y: 24, sway: 0.12, talk: 0.1 });
 });
 
 test('rig の誤りは場所がわかる日本語で知らせる', () => {
@@ -226,7 +227,7 @@ test('動き: 喋ると頭が上がり、黙ると戻る。体の下端は動か
   run(1.5, 'idle', 0);
   assert.ok(Math.abs(headAt(a)[1] - idleY) < 0.5, '黙ると戻る');
   // 体の下端（呼吸の中心）は常に同じ位置
-  nearV(apply(a.skeleton.sprite.get('body')!, [300, 1023]), [300, 1023]);
+  nearV(apply(a.skeleton.sprite.get('body')!, [300, 1023]), [300, 1023], 0.01);
 });
 
 test('動き: 寝落ちでうつむき、目を閉じる', () => {
@@ -303,34 +304,200 @@ test('調整: 続けた変更は 1 回分として元に戻せる', () => {
   assert.equal(h.undo(), undefined);
 });
 
-// ───────── 瞬き専用のコマ ─────────
+// ───────── 差し替えパーツ（スロット） ─────────
 
-import { eyeFile } from './manifest.ts';
+import { canBlink, faceSlots, hasHalfBlink, resolveValue } from './face.ts';
+import { slotVocab } from './manifest.ts';
+
+/** 両目で 1 枚の素材（eyes）で、今出す画像 */
+function eyesFile(layers: unknown[], input: Parameters<typeof faceSlots>[0]): string | undefined {
+  const rig = parseRig({ ...SAMPLE, layers });
+  const l = rig.layers[0];
+  assert.ok(l.kind === 'slot' && l.slot === 'eyes');
+  const value = resolveValue('eyes', faceSlots(input).eyes, slotVocab(rig).get('eyes'));
+  return value === undefined ? undefined : l.frames[value];
+}
 
 test('目: 瞬きは瞬き専用のコマ、状態で固定するときは表情の絵を使う', () => {
   const layers = [
     { bone: 'head', eyes: { open: 'o.png', half: 'smug.png', closed: 'smile.png', blink: { half: 'bh.png', closed: 'bc.png' } } },
   ];
+  assert.equal(eyesFile(layers, { mouth: 'closed', eye: 'half' }), 'bh.png');
+  assert.equal(eyesFile(layers, { mouth: 'closed', eye: 'closed' }), 'bc.png');
+  assert.equal(eyesFile(layers, { mouth: 'closed', eye: 'open', fixedEyes: 'closed' }), 'smile.png'); // 寝落ちなど
+  assert.equal(eyesFile(layers, { mouth: 'closed', eye: 'open', fixedEyes: 'half' }), 'smug.png');
+  assert.equal(eyesFile(layers, { mouth: 'closed', eye: 'open' }), 'o.png');
+  // 状態で目を固定している間は瞬きしない
+  assert.equal(eyesFile(layers, { mouth: 'closed', eye: 'closed', fixedEyes: 'half' }), 'smug.png');
   const rig = parseRig({ ...SAMPLE, layers });
-  const l = rig.layers[0];
-  assert.ok(l.kind === 'eyes');
-  assert.equal(eyeFile(l, 'half', true), 'bh.png');
-  assert.equal(eyeFile(l, 'closed', true), 'bc.png');
-  assert.equal(eyeFile(l, 'closed', false), 'smile.png'); // 寝落ちなど
-  assert.equal(eyeFile(l, 'half', false), 'smug.png');
-  assert.equal(eyeFile(l, 'open', true), 'o.png');
   assert.deepEqual(rigImages(rig).sort(), ['bc.png', 'bh.png', 'o.png', 'smile.png', 'smug.png']);
+  assert.ok(canBlink(slotVocab(rig)) && hasHalfBlink(slotVocab(rig)));
 });
 
 test('目: 瞬き専用のコマがなければ、表情の絵で瞬きする（今までどおり）', () => {
-  const rig = parseRig({ ...SAMPLE, layers: [{ bone: 'head', eyes: { open: 'o.png', half: 'h.png', closed: 'c.png' } }] });
-  const l = rig.layers[0];
-  assert.ok(l.kind === 'eyes');
-  assert.equal(eyeFile(l, 'closed', true), 'c.png');
-  assert.equal(eyeFile(l, 'half', true), 'h.png');
+  const plain = [{ bone: 'head', eyes: { open: 'o.png', half: 'h.png', closed: 'c.png' } }];
+  assert.equal(eyesFile(plain, { mouth: 'closed', eye: 'closed' }), 'c.png');
+  assert.equal(eyesFile(plain, { mouth: 'closed', eye: 'half' }), 'h.png');
   // 閉じたコマだけなら、半目の代わりも閉じたコマ
-  const only = parseRig({ ...SAMPLE, layers: [{ bone: 'head', eyes: { open: 'o.png', half: 'h.png', blink: { closed: 'bc.png' } } }] }).layers[0];
-  assert.ok(only.kind === 'eyes');
-  assert.equal(eyeFile(only, 'half', true), 'bc.png');
+  const only = [{ bone: 'head', eyes: { open: 'o.png', half: 'h.png', blink: { closed: 'bc.png' } } }];
+  assert.equal(eyesFile(only, { mouth: 'closed', eye: 'half' }), 'bc.png');
+  assert.equal(hasHalfBlink(slotVocab(parseRig({ ...SAMPLE, layers: only }))), false);
+  // 開いた目しかなければ瞬きできない
+  assert.equal(canBlink(slotVocab(parseRig({ ...SAMPLE, layers: [{ bone: 'head', eyes: { open: 'o.png' } }] }))), false);
   assert.throws(() => parseRig({ ...SAMPLE, layers: [{ bone: 'head', eyes: { open: 'o.png', blink: 'x.png' } }] }), /eyes\.blink/);
+});
+
+test('スロット: 素材にない値は近い絵で代用し、代わりもなければ隠す', () => {
+  const mouth = new Set(['closed', 'half', 'open', 'smile']);
+  assert.equal(resolveValue('mouth', 'i', mouth), 'half'); // 「い」の口がなければ半開き
+  assert.equal(resolveValue('mouth', 'smile_open', mouth), 'open');
+  assert.equal(resolveValue('mouth', 'frown', mouth), 'closed');
+  assert.equal(resolveValue('mouth', 'half', new Set(['closed', 'open'])), 'open');
+  const eye = new Set(['open', 'half', 'closed']);
+  assert.equal(resolveValue('eyeL', 'wide', eye), 'open');
+  assert.equal(resolveValue('eyeL', 'down', eye), 'half');
+  assert.equal(resolveValue('eyeL', 'squeeze', eye), 'closed');
+  assert.equal(resolveValue('browL', 'angry', new Set(['normal'])), 'normal');
+  // 頬・涙などは代わりがないので隠す
+  assert.equal(resolveValue('cheek', 'none', new Set(['blush', 'pale'])), undefined);
+  assert.equal(resolveValue('cheek', 'blush', new Set(['blush', 'pale'])), 'blush');
+  assert.equal(resolveValue('tears', 'on', undefined), undefined);
+});
+
+test('スロット: 表情の上書きと、瞬き・口パクの重ね方', () => {
+  const mouthVocab = new Set(['closed', 'half', 'open', 'smile', 'smile_open', 'frown']);
+  // 笑顔（目を閉じて笑う）の間は瞬きを重ねない。口は、喋っていれば「笑顔で開いた口」
+  const smile = { eyes: 'smile', mouth: 'smile' };
+  let s = faceSlots({ mouth: 'closed', eye: 'closed', overrides: smile }, mouthVocab);
+  assert.deepEqual([s.eyeL, s.eyeR, s.mouth], ['smile', 'smile', 'smile']);
+  s = faceSlots({ mouth: 'open', eye: 'open', overrides: smile }, mouthVocab);
+  assert.equal(s.mouth, 'smile_open');
+  // 開いた口の絵がない表情は、喋っている間は音量どおりの口
+  assert.equal(faceSlots({ mouth: 'half', eye: 'open', overrides: { mouth: 'frown' } }, mouthVocab).mouth, 'half');
+  // 驚いた目（開いている）には瞬きを重ねる。ウインクは閉じた側だけそのまま
+  s = faceSlots({ mouth: 'closed', eye: 'closed', overrides: { eyeL: 'wide', eyeR: 'closed', browL: 'up' } });
+  assert.deepEqual([s.eyeL, s.eyeR, s.browL, s.browR], ['blink_closed', 'closed', 'up', 'normal']);
+  // カメラで読み取った口の形は、口が開いているときだけ使う
+  assert.equal(faceSlots({ mouth: 'open', eye: 'open', mouthForm: 'u' }).mouth, 'u');
+  assert.equal(faceSlots({ mouth: 'closed', eye: 'open', mouthForm: 'u' }).mouth, 'closed');
+  // 頬などの自由なスロットはそのまま通す
+  assert.equal(faceSlots({ mouth: 'closed', eye: 'open', overrides: { cheek: 'blush' } }).cheek, 'blush');
+});
+
+test('スロット: 奥行き・切り抜き・視線・表情を rig で読める', () => {
+  const rig = parseRig({
+    ...SAMPLE,
+    bones: { ...SAMPLE.bones, frontHair: { parent: 'head', pivot: [512, 200], depth: 1.3 } },
+    layers: [
+      { bone: 'head', image: 'face.png' },
+      { bone: 'head', slot: 'eyeL', id: 'whiteL', frames: { open: 'w.png', half: 'wh.png' }, depth: 1 },
+      { bone: 'head', image: 'pupil.png', clip: 'whiteL', gaze: [18, 10], depth: 1 },
+      { bone: 'head', slot: 'eyeL', frames: { open: 'l.png', closed: 'lc.png' }, depth: 1 },
+      { bone: 'frontHair', image: 'hair.png' },
+    ],
+    expressions: { smile: { eyes: 'smile', mouth: 'smile' } },
+  });
+  assert.deepEqual(rig.layers.map((l) => l.depth), [0, 1, 1, 1, 1.3]); // 書かなければボーンの奥行き
+  assert.deepEqual(rig.layers[2].gaze, [18, 10]);
+  assert.deepEqual([...slotVocab(rig).get('eyeL')!].sort(), ['closed', 'half', 'open']);
+  assert.deepEqual(rig.expressions.smile, { eyes: 'smile', mouth: 'smile' });
+  const bad = (layers: unknown[]) => () => parseRig({ ...SAMPLE, layers });
+  assert.throws(bad([{ bone: 'head', image: 'a.png', clip: 'nope' }]), /layers\[0\]\.clip/);
+  assert.throws(bad([{ bone: 'head', image: 'a.png', id: 'x' }, { bone: 'head', image: 'b.png', id: 'x' }]), /id「x」/);
+  assert.throws(bad([{ bone: 'head', slot: 'mouth', frames: {} }]), /layers\[0\]\.frames/);
+  assert.throws(bad([{ bone: 'head', image: 'a.png', depth: 'far' }]), /layers\[0\]\.depth/);
+});
+
+test('動き: 顔の向きは「ずれの量」になり、範囲を超えない。調整中は 0', () => {
+  const a = new Animator(parseRig({ ...SAMPLE, motion: { turn: { x: 40, y: 20, sway: 0, talk: 0 } } }), seeded(8));
+  const dt = 1 / 60;
+  let t = 0;
+  const run = (head?: { yaw: number; pitch: number; roll: number }, still = false) => {
+    for (let i = 0; i < 60; i++) a.update({ t: (t += dt), dt, state: 'idle', mouth: 0, head, still });
+  };
+  run();
+  nearV(a.turn, [0, 0], 1e-6);
+  run({ yaw: 0.5, pitch: -1, roll: 10 });
+  nearV(a.turn, [20, -20], 0.01);
+  // 傾きは首と頭に分けてかかる
+  assert.ok(a.skeleton.pose('neck')!.rotation + a.skeleton.pose('head')!.rotation > (9 * Math.PI) / 180);
+  run({ yaw: 5, pitch: 0, roll: 0 });
+  near(a.turn[0], 40, 0.01);
+  run(undefined, true);
+  nearV(a.turn, [0, 0]);
+});
+
+// ───────── メッシュ変形（しなり） ─────────
+
+import { bendWeights, makeGrid, resolveBend, skin } from './mesh.ts';
+
+test('メッシュ: 網の頂点と三角形の数、テクスチャ座標', () => {
+  const g = makeGrid(100, 50, 4, 2);
+  assert.equal(g.rest.length / 2, 5 * 3);
+  assert.equal(g.indices.length, 4 * 2 * 6);
+  nearV([g.rest[g.rest.length - 2], g.rest[g.rest.length - 1]], [100, 50]);
+  nearV([g.uvs[2], g.uvs[3]], [0.25, 0]);
+  assert.ok(Math.max(...g.indices) === 14);
+});
+
+test('メッシュ: 重みは回転の中心から軸に沿って 0 → 1 に増える', () => {
+  const g = makeGrid(100, 400, 1, 4); // 縦に 0, 100, 200, 300, 400
+  const b = resolveBend({ start: 100, end: 300, curve: 1, grid: [1, 4] }, [50, 0], undefined, [100, 400]);
+  nearV([...b.axis], [0, 1], 1e-3); // 中心から絵の中央へ向かう向き = 下
+  const w = bendWeights(g.rest, [50, 0], b);
+  // 左の列だけ見る（行ごとに 2 頂点）
+  nearV([0, 1, 2, 3, 4].map((j) => w[j * 2]), [0, 0, 0.5, 1, 1]);
+  // 揺れものがあれば、その向きと長さを使う
+  const s = resolveBend({ start: 0, curve: 1, grid: [1, 1] }, [0, 0], { direction: [1, 0], length: 250 }, [100, 100]);
+  nearV([...s.axis, s.end], [1, 0, 250]);
+});
+
+test('メッシュ: 根元は親のまま、先端はボーンの動きどおり、途中は混ざる', () => {
+  const g = makeGrid(10, 200, 1, 2); // y = 0, 100, 200
+  const pivot: [number, number] = [5, 0];
+  const w = bendWeights(g.rest, pivot, resolveBend({ start: 0, end: 200, curve: 1, grid: [1, 2] }, pivot, undefined, [10, 200]));
+  const root = { a: 1, b: 0, c: 0, d: 1, tx: 0, ty: 0 };
+  const tip = localMatrix(pivot, { ...restPose(), rotation: -Math.PI / 2 }); // 先端を横へ振る
+  const out = new Float32Array(g.rest.length);
+  skin(g.rest, w, root, tip, out);
+  nearV([out[0], out[1]], [0, 0]); // 根元（重み 0）は動かない
+  nearV([out[8], out[9]], apply(tip, [0, 200])); // 先端（重み 1）は回ったとおり
+  const mid = (a: number, b: number) => (a + b) / 2;
+  const t = apply(tip, [0, 100]);
+  nearV([out[4], out[5]], [mid(0, t[0]), mid(100, t[1])]); // 途中は半分ずつ
+});
+
+test('しなり: rig で読める（true は既定値、誤りは日本語で）', () => {
+  const rig = parseRig({ ...SAMPLE, layers: [{ bone: 'frontHair', image: 'f.png', bend: true }, { bone: 'body', image: 'b.png', bend: { start: 10, grid: [8, 4], axis: [0, -1], end: 300 } }] });
+  const [a, b] = rig.layers;
+  assert.ok(a.kind === 'image' && b.kind === 'image');
+  assert.deepEqual(a.bend?.grid, [16, 16]);
+  assert.deepEqual(b.bend, { start: 10, curve: 1.5, grid: [8, 4], axis: [0, -1], end: 300 });
+  assert.throws(() => parseRig({ ...SAMPLE, layers: [{ bone: 'body', image: 'b.png', bend: { grid: [0, 4] } }] }), /bend\.grid/);
+  assert.throws(() => parseRig({ ...SAMPLE, layers: [{ bone: 'head', mouth: { closed: 'a', open: 'b' }, bend: true }] }), /image のパーツにだけ/);
+});
+
+test('動き: 喋ると体が伸び、戻るときに少しつぶれる（横幅は逆）', () => {
+  const a = new Animator(parseRig({ ...SAMPLE, motion: { breath: { amount: 0 } } }), seeded(7));
+  const dt = 1 / 120;
+  let t = 0;
+  const body = () => a.skeleton.pose('body')!;
+  for (let i = 0; i < 60; i++) a.update({ t: (t += dt), dt, state: 'talk', mouth: 1 });
+  assert.ok(body().squashY > 1.005 && body().squashX < 1, `伸びる ${body().squashY}`);
+  let minY = Infinity;
+  for (let i = 0; i < 120; i++) {
+    a.update({ t: (t += dt), dt, state: 'idle', mouth: 0 });
+    minY = Math.min(minY, body().squashY);
+  }
+  assert.ok(minY < 0.999, `戻るときにつぶれる ${minY}`);
+  for (let i = 0; i < 240; i++) a.update({ t: (t += dt), dt, state: 'idle', mouth: 0 });
+  near(body().squashY, 1, 1e-3);
+});
+
+test('調整: layers（配列）の中も書き換えられる', () => {
+  const raw = { layers: [{ bone: 'a', image: 'a.png' }, { bone: 'b', image: 'b.png' }] };
+  const next = setIn(raw, ['layers', '1', 'bend'], {});
+  assert.ok(Array.isArray(next.layers));
+  assert.deepEqual((next.layers as unknown[])[1], { bone: 'b', image: 'b.png', bend: {} });
+  assert.deepEqual(setIn(next, ['layers', '1', 'bend'], undefined), raw);
 });

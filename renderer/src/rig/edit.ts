@@ -20,14 +20,14 @@ export const BONE_LABELS: Record<string, string> = {
 export const boneLabel = (name: string) => BONE_LABELS[name] ?? name;
 
 type Json = Record<string, unknown>;
-const isObj = (v: unknown): v is Json => typeof v === 'object' && v !== null && !Array.isArray(v);
 
 /** `path` の場所に値を入れた新しい rig を返す（途中の項目がなければ作る。元の rig は変えない） */
 export function setIn(raw: RawRig, path: readonly string[], value: unknown): RawRig {
   const out = structuredClone(raw);
   let cur: Json = out;
   for (const key of path.slice(0, -1)) {
-    if (!isObj(cur[key])) cur[key] = {};
+    // 配列（layers）の中も、番号を文字列で指定してたどれる
+    if (typeof cur[key] !== 'object' || cur[key] === null) cur[key] = {};
     cur = cur[key] as Json;
   }
   const last = path[path.length - 1];

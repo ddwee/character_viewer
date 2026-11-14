@@ -1,5 +1,7 @@
 // エンジンの設定 API（engine/src/api.rs）を呼ぶ。
 
+import type { CameraConfig } from '../rig/track';
+
 export type AvatarState = 'idle' | 'talk' | 'away' | 'sleep';
 
 export interface Settings {
@@ -15,6 +17,10 @@ export interface Settings {
   };
   avatar: { awaySecs: number; sleepSecs: number; dir: string | null };
   display: { blink: boolean; blinkRate: number; mirror: boolean };
+  /** カメラで顔を読み取る設定 */
+  camera: CameraConfig;
+  /** 表情を切り替えるキー（表情の名前 → キーの組み合わせ） */
+  hotkeys: Record<string, string>;
   server: { port: number };
 }
 

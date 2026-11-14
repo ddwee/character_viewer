@@ -112,7 +112,7 @@ fn remove_old(dir: &std::path::Path) {
 }
 
 /// 現地時刻（"YYYY-MM-DD", "HH:MM:SS"）
-fn now_local() -> (String, String) {
+pub(crate) fn now_local() -> (String, String) {
     #[cfg(windows)]
     {
         use windows_sys::Win32::Foundation::SYSTEMTIME;
