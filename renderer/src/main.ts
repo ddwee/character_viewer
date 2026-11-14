@@ -1,20 +1,34 @@
 // 描画ページ（OBS のブラウザソースで開く）。
-// エンジンから WebSocket で届いた状態に合わせて透過画像を切り替え、まばたきもさせる。
+// エンジンから WebSocket で届いた状態に合わせて絵を変える。表示のしかたは素材によって 2 通り:
 //
-// 絵が変わるときだけ描く（毎フレームは描き直さない）。OBS の負荷が軽く、
-// 描き直しのタイミングによるちらつきも起きにくい。
+// - 1 枚絵: 状態ごとの透過画像を切り替え、まばたきもさせる。
+//   絵が変わるときだけ描く（毎フレームは描き直さない）。OBS の負荷が軽く、ちらつきも起きにくい
+// - パーツ（avatar.json に rig があるとき）: パーツを重ね、ボーンで動かす（呼吸・頭の揺れ・髪の揺れ・口パク・まばたき）。
+//   動き続けるので毎フレーム描く。口の開き具合はエンジンから約 100 回/秒で届く音量で決める。
+//   カメラを使っているときは、読み取った顔の向き・視線・表情（約 30 回/秒で届く）も反映する（rig/track.ts）
 //
 // URL のオプション
-//   ?debug    状態・接続・音量を左上に表示。キー 1〜4 で状態を手動で切り替え、B でまばたき
+//   ?debug    状態・接続・音量を左上に表示。キー 1〜4 で状態を手動で切り替え（発話は声のまね付き）、B でまばたき
 //   ?checker  背景を市松模様にする（ブラウザで透過を確認する用）
 //   ?sync     遅延測定用。発話中は白、それ以外は黒で全体を塗る（cv-engine --measure-av で解析する）
 //   ?engine=127.0.0.1:39540  エンジンの場所（通常は不要）
-//   ?embed    設定画面の中のプレビュー用（エンジンへ描画の応答を返さない）
+//   ?embed    設定画面の中のプレビュー用（エンジンへ描画の応答を返さない。いまの絵を PNG で渡せる）
+//   ?face=yaw:0.5,pitch:-0.2,roll:5,gx:1,gy:0,eyeL:smile,mouth:smile,expr:smile
+//             顔の向き・視線・差し替えパーツを固定する（パーツの素材の確認用）。
+//             yaw・pitch・gx・gy は -1〜1、roll は度、expr は rig.expressions の名前、ほかはスロットの値
 
-import { Application, Assets, Sprite, Texture } from 'pixi.js';
+import { Application, Assets, Container, Rectangle, Sprite, Texture } from 'pixi.js';
 import 'pixi.js/prepare';
 
 import { BlinkScheduler, type Eye } from './blink';
+import { faceSlots, type SlotValues } from './rig/face';
+import { parseRig, rigImages, type Rig } from './rig/manifest';
+import { Animator, type HeadPose } from './rig/motion';
+import { MouthController, type Mouth } from './rig/mouth';
+import { loadImage, trimmedTexture } from './rig/texture';
+import { FaceTracker, type FaceMsg, type Tracked } from './rig/track';
+import { RigView, type FaceView } from './rig/view';
+import { rigFrame, unpremultiply } from './snapshot';
 
 type AvatarState = 'idle' | 'talk' | 'away' | 'sleep';
 
@@ -33,7 +47,9 @@ type StateEntry =
     };
 
 interface Manifest {
-  states: Partial<Record<AvatarState, StateEntry>>;
+  states?: Partial<Record<AvatarState, StateEntry>>;
+  /** パーツを重ねてボーンで動かす設定（あれば states は使わない） */
+  rig?: unknown;
 }
 
 /** 1 状態ぶんの絵 */
@@ -41,6 +57,17 @@ interface Look {
   open: Texture;
   half?: Texture;
   closed?: Texture;
+}
+
+/** パーツで動かす素材 */
+interface RigAvatar {
+  rig: Rig;
+  view: RigView;
+  animator: Animator;
+  /** ファイル名 → テクスチャ（rig だけ変わったときは使い回す） */
+  textures: Map<string, Texture>;
+  /** 読み込んだ rig の JSON（変わっていなければ組み直さない） */
+  source: string;
 }
 
 /** 見た目の設定（設定画面で変える） */
@@ -54,8 +81,14 @@ type ServerMsg =
   | { type: 'hello'; version: number }
   | { type: 'state'; state: AvatarState; seq: number }
   | ({ type: 'config' } & DisplayConfig)
-  | { type: 'reload' }
-  | { type: 'meter'; db: number; voicing: number; voiced: boolean };
+  /** images が false なら変わったのは avatar.json だけ（古いエンジンは images を送らない） */
+  | { type: 'reload'; images?: boolean }
+  | { type: 'meter'; db: number; voicing: number; voiced: boolean }
+  | { type: 'level'; db: number }
+  /** カメラで読み取った顔 */
+  | FaceMsg
+  /** 手動で選んだ表情（rig.expressions の名前。null で解除） */
+  | { type: 'expression'; name: string | null };
 
 const PROTOCOL_VERSION = 1;
 const RECONNECT_MS = 1000;
@@ -73,6 +106,52 @@ const sprite = new Sprite();
 const looks = new Map<AvatarState, Look>();
 const blink = new BlinkScheduler(Math.random, performance.now());
 const EMPTY_LOOK: Look = { open: Texture.EMPTY };
+const mouth = new MouthController();
+/** パーツで動かす素材（1 枚絵のときは null） */
+let rigAvatar: RigAvatar | null = null;
+/** 前のフレームの時刻（パーツの動き用） */
+let lastFrameAt: number | null = null;
+/** 発話をプレビュー・デバッグで試しているとき、声のまねをする（エンジンの音量の代わり） */
+let simulateVoice = false;
+let mouthShape: Mouth = 'closed';
+
+/** 顔の向き・視線・差し替えパーツの指定（?face= や設定画面から。カメラの値もここに入る） */
+interface FaceControl {
+  head?: HeadPose;
+  gaze: [number, number];
+  /** 表情（rig.expressions の名前） */
+  expression?: string;
+  /** スロットの値の上書き（表情より優先） */
+  slots: SlotValues;
+}
+
+/** "yaw:0.5,eyeL:smile" の形の指定を読む */
+function parseFace(text: string | null): FaceControl {
+  const out: FaceControl = { gaze: [0, 0], slots: {} };
+  const head: HeadPose = { yaw: 0, pitch: 0, roll: 0 };
+  for (const item of (text ?? '').split(',')) {
+    const [key, value] = item.split(':').map((v) => v.trim());
+    if (!key || value === undefined) continue;
+    const n = Number(value);
+    if (key === 'yaw' || key === 'pitch' || key === 'roll') {
+      if (Number.isFinite(n)) out.head = Object.assign(head, { [key]: n });
+    } else if (key === 'gx' || key === 'gy') {
+      if (Number.isFinite(n)) out.gaze[key === 'gx' ? 0 : 1] = n;
+    } else if (key === 'expr') out.expression = value;
+    else out.slots[key] = value;
+  }
+  return out;
+}
+
+let faceControl = parseFace(params.get('face'));
+/** カメラで読み取った顔 */
+const faceTracker = new FaceTracker();
+/** 今のフレームで使う、カメラの顔（カメラなし・顔が見つからないときは null） */
+let tracked: Tracked | null = null;
+/** 設定画面やキー操作で選んだ表情（エンジンから届く） */
+let chosenExpression: string | null = null;
+/** 最後に描いた顔（PNG で保存するときに、目だけ開けて描き直す） */
+let lastFace: FaceView | null = null;
 
 let current: AvatarState = 'idle';
 let config: DisplayConfig = { blink: true, blinkRate: 1, mirror: false };
@@ -91,9 +170,22 @@ function lookFor(state: AvatarState): Look {
   return EMPTY_LOOK;
 }
 
+/** パーツが動いてはみ出さないよう、上と左右に空けておく割合 */
+const RIG_MARGIN = 0.03;
+
 /** 画面に収まる最大サイズで、下端中央に置く */
 function layout(): void {
   if (syncMode) return drawSync();
+  if (rigAvatar) {
+    const [w, h] = rigAvatar.view.size;
+    const root = rigAvatar.view.root;
+    const { width, height } = app.screen;
+    const scale = Math.min(width / (w * (1 + 2 * RIG_MARGIN)), height / (h * (1 + RIG_MARGIN)));
+    root.pivot.set(w / 2, h);
+    root.scale.set(config.mirror ? -scale : scale, scale);
+    root.position.set(width / 2, height);
+    return;
+  }
   const tex = sprite.texture;
   if (tex.width === 0 || tex.height === 0) return;
   const { width, height } = app.screen;
@@ -136,10 +228,68 @@ function drawAvatar(now: number, look: Look): void {
   }
 }
 
+/** 声のまね（1 秒に 5 回ほど口が開閉する音量） */
+function fakeLevel(now: number): number {
+  const t = now / 1000;
+  return -18 - 24 * (1 - Math.abs(Math.sin(Math.PI * 2.6 * t)) * (0.75 + 0.25 * Math.sin(t * 1.7)));
+}
+
+/** その状態でまばたきするか */
+function blinksIn(state: AvatarState): boolean {
+  if (!config.blink) return false;
+  if (rigAvatar) return rigAvatar.view.canBlink && !rigAvatar.animator.eyesFor(state);
+  return !!lookFor(state).closed;
+}
+
+function drawRig(now: number, av: RigAvatar): void {
+  const dt = lastFrameAt === null ? 0 : (now - lastFrameAt) / 1000;
+  lastFrameAt = now;
+
+  if (simulateVoice && current === 'talk') mouth.level(fakeLevel(now), now);
+  mouthShape = mouth.update(now);
+
+  tracked = faceTracker.current(now);
+  const state = poseState();
+
+  const prevEye = eye;
+  // 状態で目を固定するとき（寝落ちなど）は表情の絵、そうでなければ瞬き。カメラで目を読み取っているときは、本人の瞬きに任せる
+  const fixed = av.animator.eyesFor(state);
+  eye = !fixed && !tracked?.eyes && blinksIn(state) ? blink.update(now, av.view.hasHalfEyes) : 'open';
+  if (prevEye === 'open' && eye !== 'open') stats.blinks++;
+
+  av.animator.update({ t: now / 1000, dt, state, mouth: current === 'talk' ? mouth.amount : 0, head: faceControl.head ?? tracked?.head });
+  lastFace = faceView(av, eye);
+  av.view.update(av.animator.skeleton, lastFace);
+}
+
+/**
+ * 姿勢に使う状態。カメラに顔が映っている間は、黙っていても「放置」「寝落ち」の姿勢にしない
+ * （本人が起きて画面を見ているのに、キャラクターだけ寝てしまわないように）
+ */
+function poseState(): AvatarState {
+  return tracked && (current === 'away' || current === 'sleep') ? 'idle' : current;
+}
+
+/** 今の顔（スロットの値・向き・視線）。`eyeNow` は瞬きの状態 */
+function faceView(av: RigAvatar, eyeNow: Eye): FaceView {
+  // 優先順: カメラの表情 < 選んだ表情（設定画面・キー操作）< ?face= の指定
+  const expression = faceControl.expression ?? chosenExpression ?? undefined;
+  const overrides = { ...tracked?.overrides, ...(expression ? av.rig.expressions[expression] : undefined), ...faceControl.slots };
+  // 声が出ていないときは、カメラで見た口の開きを使う（あくび、驚いて口を開ける、など）
+  const mouthNow = mouthShape === 'closed' && tracked ? tracked.mouthOpen : mouthShape;
+  const slots = faceSlots(
+    { mouth: mouthNow, eye: eyeNow, fixedEyes: av.animator.eyesFor(poseState()), overrides, mouthForm: tracked?.mouthForm },
+    av.view.vocab.get('mouth'),
+  );
+  const manualGaze = faceControl.gaze[0] !== 0 || faceControl.gaze[1] !== 0;
+  return { slots, turn: av.animator.turn, gaze: manualGaze ? faceControl.gaze : (tracked?.gaze ?? faceControl.gaze) };
+}
+
 function frame(now: number): void {
   frameRequested = false;
   const look = lookFor(current);
   if (syncMode) drawSync();
+  else if (rigAvatar) drawRig(now, rigAvatar);
   else drawAvatar(now, look);
   app.render();
   stats.renders++;
@@ -148,8 +298,14 @@ function frame(now: number): void {
   for (const seq of pendingAcks) sendAck(seq);
   pendingAcks = [];
 
-  // 次に描くべき時刻まで眠る（まばたき中は毎フレーム描く）
+  // パーツで動かすときは毎フレーム描く
   clearTimeout(wakeTimer);
+  if (!syncMode && rigAvatar) {
+    requestFrame();
+    return;
+  }
+  lastFrameAt = null;
+  // 次に描くべき時刻まで眠る（まばたき中は毎フレーム描く）
   if (!syncMode && look.closed && config.blink) {
     const wakeAt = blink.wakeAt();
     if (wakeAt <= now) requestFrame();
@@ -157,15 +313,78 @@ function frame(now: number): void {
   }
 }
 
-function show(state: AvatarState): void {
+/**
+ * いまの絵を、素材の解像度（拡大・縮小なし）の透過 PNG にする（設定画面の「PNG で保存」）。
+ * 左右反転は OBS の表示と同じにかける。瞬きの途中なら目を開けた絵で写す（サムネイル用なので）
+ */
+async function snapshot(): Promise<Blob> {
+  if (syncMode) throw new Error('遅延測定の表示では保存できません');
+  const wrap = new Container();
+  const flip = config.mirror ? -1 : 1;
+  let frame: Rectangle;
+  let restore: () => void;
+
+  if (rigAvatar) {
+    const { view, animator } = rigAvatar;
+    const [w, h] = view.size;
+    if (eye !== 'open' && lastFace) view.update(animator.skeleton, faceView(rigAvatar, 'open'));
+    // 画面用の配置（縮小・下端中央）を外して、画像の座標のまま写す。終わったら元の場所に戻す
+    const root = view.root;
+    const parent = root.parent;
+    const index = parent ? parent.getChildIndex(root) : 0;
+    root.pivot.set(0, 0);
+    root.scale.set(flip, 1);
+    root.position.set(config.mirror ? w : 0, 0);
+    wrap.addChild(root);
+    const f = rigFrame(w, h, RIG_MARGIN);
+    frame = new Rectangle(f.x, f.y, f.width, f.height);
+    restore = () => {
+      parent?.addChildAt(root, index);
+      layout();
+    };
+  } else {
+    const tex = lookFor(current).open;
+    if (tex.width <= 1 || tex.height <= 1) throw new Error('絵がまだ読み込まれていません');
+    const s = new Sprite(tex);
+    s.scale.set(flip, 1);
+    s.position.set(config.mirror ? tex.width : 0, 0);
+    wrap.addChild(s);
+    frame = new Rectangle(0, 0, tex.width, tex.height);
+    restore = () => s.destroy();
+  }
+
+  let image: ImageData;
+  try {
+    const { pixels, width, height } = app.renderer.extract.pixels({ target: wrap, frame, resolution: 1 });
+    unpremultiply(pixels);
+    image = new ImageData(pixels as Uint8ClampedArray<ArrayBuffer>, width, height);
+  } finally {
+    restore();
+    wrap.destroy();
+    requestFrame();
+  }
+
+  const canvas = document.createElement('canvas');
+  canvas.width = image.width;
+  canvas.height = image.height;
+  canvas.getContext('2d')!.putImageData(image, 0, 0);
+  return new Promise((resolve, reject) =>
+    canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('PNG にできませんでした'))), 'image/png'),
+  );
+}
+
+/** 状態を変える。`simulated` はプレビュー・デバッグで試すとき（発話なら声のまねをする） */
+function show(state: AvatarState, simulated = false): void {
+  simulateVoice = simulated;
   const prev = current;
   if (prev === state) return;
   current = state;
 
   const now = performance.now();
   blink.setTalking(state === 'talk');
+  mouth.setTalking(state === 'talk', now);
   // まばたきできない絵（寝落ちなど）から戻ったら、予定を立て直す
-  if (!lookFor(prev).closed && lookFor(state).closed) blink.reschedule(now);
+  if (!blinksIn(prev) && blinksIn(state)) blink.reschedule(now);
   // 話し終わり・目覚めは、まばたきが起きやすい区切り
   if ((prev === 'talk' && state === 'idle') || ((prev === 'away' || prev === 'sleep') && state === 'talk')) {
     blink.cue(now);
@@ -193,14 +412,71 @@ async function loadLook(entry: StateEntry): Promise<Look> {
 }
 
 /**
- * 素材を読み込む。読み込み直しのときは、新しい絵がすべて揃ってから入れ替える
- * （途中で失敗したら今の絵のまま）
+ * パーツの素材を用意する。`reuse` にある画像は読み直さずに使う（rig だけ変わったとき）。
+ * 新しく読んだ画像は GPU へ送るところまで済ませる
  */
-async function loadAvatar(): Promise<void> {
+async function loadRig(raw: unknown, reuse?: Map<string, Texture>): Promise<RigAvatar> {
+  const rig = parseRig(raw);
+  const files = rigImages(rig);
+  const textures = new Map<string, Texture>();
+  const fresh: Texture[] = [];
+  await Promise.all(
+    files.map(async (f) => {
+      let t = reuse?.get(f);
+      // パーツは透明な余白を切り詰めて GPU に送る（rig/texture.ts）
+      if (!t) fresh.push((t = trimmedTexture(await loadImage(`avatar/${encodeURI(f)}?v=${avatarVersion}`))));
+      textures.set(f, t);
+    }),
+  );
+  await app.renderer.prepare.upload(fresh);
+  return { rig, view: new RigView(rig, textures), animator: new Animator(rig), textures, source: JSON.stringify(raw) };
+}
+
+/** 入れ替える前の絵を、描き替えたあとで GPU とキャッシュから外す（新しい絵でも使うものは残す） */
+function retireOld(oldLooks: Texture[], oldRig: RigAvatar | null): void {
+  requestAnimationFrame(() => {
+    const keep = new Set<Texture | undefined>([...looks.values()].flatMap((l) => [l.open, l.half, l.closed]));
+    for (const t of rigAvatar?.textures.values() ?? []) keep.add(t);
+    for (const t of oldLooks) if (!keep.has(t)) t.destroy(true);
+    if (oldRig) {
+      oldRig.view.destroy();
+      for (const t of oldRig.textures.values()) if (!keep.has(t)) t.destroy(true);
+    }
+  });
+}
+
+/**
+ * 素材を読み込む。読み込み直しのときは、新しい絵がすべて揃ってから入れ替える
+ * （途中で失敗したら今の絵のまま）。
+ * `images` が false なら avatar.json だけが変わったので、パーツの画像は読み直さない
+ */
+async function loadAvatar(images = true): Promise<void> {
   avatarVersion++;
   const res = await fetch(`avatar/avatar.json?v=${avatarVersion}`, { cache: 'no-store' });
   if (!res.ok) throw new Error(`avatar/avatar.json を読み込めません（${res.status}）`);
   const manifest = (await res.json()) as Manifest;
+
+  const textures = (m: Map<AvatarState, Look>) => [...m.values()].flatMap((l) => [l.open, l.half, l.closed]).filter((t): t is Texture => !!t);
+
+  if (manifest.rig !== undefined) {
+    // 同じ rig なら何もしない（設定画面の保存と、フォルダの監視で 2 回通知が来る）
+    if (!images && rigAvatar?.source === JSON.stringify(manifest.rig)) return;
+    const next = await loadRig(manifest.rig, images ? undefined : rigAvatar?.textures);
+    const oldLooks = textures(looks);
+    const oldRig = rigAvatar;
+    looks.clear();
+    oldRig?.view.root.removeFromParent();
+    sprite.visible = false;
+    rigAvatar = next;
+    app.stage.addChild(next.view.root);
+    lastFrameAt = null;
+    layout();
+    overlay.clearError();
+    subscribe();
+    requestFrame();
+    retireOld(oldLooks, oldRig);
+    return;
+  }
 
   const next = new Map<AvatarState, Look>();
   await Promise.all(
@@ -212,38 +488,39 @@ async function loadAvatar(): Promise<void> {
   if (!next.has('idle')) throw new Error('待機の絵が設定されていません（設定画面の「画像」で設定してください）');
 
   // 切り替えた瞬間にカクつかないよう、全画像を先に GPU へ送っておく
-  const textures = (m: Map<AvatarState, Look>) => [...m.values()].flatMap((l) => [l.open, l.half, l.closed]).filter((t): t is Texture => !!t);
   await app.renderer.prepare.upload(textures(next));
 
   const old = textures(looks);
+  const oldRig = rigAvatar;
+  oldRig?.view.root.removeFromParent();
+  rigAvatar = null;
+  sprite.visible = true;
   looks.clear();
   for (const [k, v] of next) looks.set(k, v);
   sprite.texture = Texture.EMPTY;
   overlay.clearError();
+  subscribe();
   requestFrame();
-  // 古い絵を GPU とキャッシュから外す（描き替えたあとで）
-  requestAnimationFrame(() => {
-    for (const t of old) if (!textures(looks).includes(t)) t.destroy(true);
-  });
+  retireOld(old, oldRig);
 }
 
 let reloading: Promise<void> | null = null;
-let reloadAgain = false;
+/** 読み込み中に届いた通知（次に読み込み直すときに画像も読み直すか） */
+let reloadAgain: { images: boolean } | null = null;
 
 /** 素材が変わったという通知で読み込み直す（連続した通知はまとめる） */
-function reloadAvatar(): void {
+function reloadAvatar(images = true): void {
   if (reloading) {
-    reloadAgain = true;
+    reloadAgain = { images: images || (reloadAgain?.images ?? false) };
     return;
   }
-  reloading = loadAvatar()
+  reloading = loadAvatar(images)
     .catch((e) => overlay.error(e instanceof Error ? e.message : String(e)))
     .finally(() => {
       reloading = null;
-      if (reloadAgain) {
-        reloadAgain = false;
-        reloadAvatar();
-      }
+      const again = reloadAgain;
+      reloadAgain = null;
+      if (again) reloadAvatar(again.images);
     });
 }
 
@@ -256,6 +533,8 @@ function engineUrl(): string {
 }
 
 let disconnectTimer: ReturnType<typeof setTimeout> | undefined;
+/** 音量の購読を送り直す（素材がパーツかどうかで、口用の音量が要るかが変わる） */
+let subscribe: () => void = () => {};
 
 function connect(): void {
   const ws = new WebSocket(engineUrl());
@@ -265,7 +544,8 @@ function connect(): void {
     clearTimeout(disconnectTimer);
     if (!embed) sendAck = (seq) => send({ type: 'ack', seq });
     overlay.connected(true);
-    if (debug) send({ type: 'subscribe', meter: true });
+    subscribe = () => send({ type: 'subscribe', meter: debug, level: rigAvatar !== null, face: rigAvatar !== null });
+    if (debug || rigAvatar) subscribe();
   };
 
   ws.onmessage = (ev: MessageEvent<string>) => {
@@ -288,19 +568,30 @@ function connect(): void {
         blink.setRate(config.blinkRate);
         blink.reschedule(performance.now());
         sprite.texture = Texture.EMPTY; // 反転などを反映させるため配置し直す
+        if (rigAvatar) layout();
         requestFrame();
         break;
       }
       case 'reload':
-        if (!syncMode) reloadAvatar();
+        if (!syncMode) reloadAvatar(msg.images ?? true);
         break;
       case 'meter':
         overlay.meter(msg.db, msg.voicing, msg.voiced);
+        break;
+      case 'level':
+        if (!simulateVoice) mouth.level(msg.db, performance.now());
+        break;
+      case 'face':
+        faceTracker.update(msg, performance.now());
+        break;
+      case 'expression':
+        chosenExpression = msg.name;
         break;
     }
   };
 
   ws.onclose = () => {
+    subscribe = () => {};
     overlay.connected(false);
     // 短い切断ではそのまま。続くようなら喋りっぱなしにならないよう待機に戻す
     clearTimeout(disconnectTimer);
@@ -324,10 +615,11 @@ const overlay = (() => {
     if (!debug) return;
     el.textContent = [
       `接続 : ${conn ? '○ エンジンと接続中' : '× 未接続（再接続を試行中）'}`,
-      `状態 : ${LABELS[current]}（${current}）`,
+      `状態 : ${LABELS[current]}（${current}）${rigAvatar ? `  口 ${mouthShape} / 目 ${eye}` : ''}`,
+      rigAvatar ? `カメラ: ${tracked ? `向き ${tracked.head.yaw.toFixed(2)} / ${tracked.head.pitch.toFixed(2)} / 傾き ${tracked.head.roll.toFixed(0)}°  ${JSON.stringify(tracked.overrides)}` : '読み取っていません'}${chosenExpression ? `  表情 ${chosenExpression}` : ''}` : '',
       level,
       `回数 : 切替 ${stats.changes} / 再接続 ${stats.reconnects} / まばたき ${stats.blinks} / 描画 ${stats.renders}`,
-      'キー 1〜4 で状態を切り替え、B でまばたき',
+      'キー 1〜4 で状態を切り替え（発話は声のまね付き）、B でまばたき',
     ]
       .filter(Boolean)
       .join('\n');
@@ -337,7 +629,7 @@ const overlay = (() => {
     el.hidden = false;
     window.addEventListener('keydown', (e) => {
       const state = STATES[Number(e.key) - 1];
-      if (state) show(state);
+      if (state) show(state, true);
       if (e.key === 'b' || e.key === 'B') {
         blink.blinkNow(performance.now());
         requestFrame();
@@ -411,11 +703,21 @@ async function main(): Promise<void> {
   if (embed) {
     window.addEventListener('message', (e: MessageEvent) => {
       if (e.origin !== location.origin) return;
-      const m = e.data as { type?: string; state?: AvatarState };
-      if (m.type === 'preview-state' && m.state && STATES.includes(m.state)) show(m.state);
+      const m = e.data as { type?: string; state?: AvatarState; id?: number };
+      if (m.type === 'preview-state' && m.state && STATES.includes(m.state)) show(m.state, true);
+      // 顔の向き・表情を試す（"yaw:0.5,expr:smile" の形。空文字で解除）
+      if (m.type === 'preview-face') faceControl = parseFace((m as { face?: string }).face ?? '');
       if (m.type === 'preview-blink') {
         blink.blinkNow(performance.now());
         requestFrame();
+      }
+      if (m.type === 'snapshot') {
+        const reply = (r: object) => (e.source as Window | null)?.postMessage({ type: 'snapshot-result', id: m.id, ...r }, e.origin);
+        const state = current;
+        snapshot().then(
+          (png) => reply({ png, state }),
+          (err: unknown) => reply({ error: err instanceof Error ? err.message : String(err) }),
+        );
       }
     });
   }

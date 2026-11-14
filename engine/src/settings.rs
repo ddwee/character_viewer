@@ -5,6 +5,7 @@
 //! - 読めない設定ファイルは settings.broken-<時刻>.json に退避して既定値で起動する
 //! - 保存は一時ファイルに書いてから置き換える（書き込み中に落ちても壊れない）
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -25,6 +26,10 @@ pub struct Settings {
     pub audio: AudioSettings,
     pub avatar: AvatarSettings,
     pub display: DisplaySettings,
+    pub camera: CameraSettings,
+    /// 表情を切り替えるキー（表情の名前 → "Ctrl+Alt+Digit1" のようなキーの組み合わせ）。
+    /// アプリとして動いているときに、ほかのアプリを使っている間も効く
+    pub hotkeys: BTreeMap<String, String>,
     pub server: ServerSettings,
 }
 
@@ -70,6 +75,55 @@ pub struct DisplaySettings {
     pub mirror: bool,
 }
 
+/// カメラで顔の向き・表情を読み取る設定（読み取りは tracker ページが行う。renderer/src/tracker）
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CameraSettings {
+    /// カメラを使う
+    pub enabled: bool,
+    /// カメラの名前。None なら既定のカメラ
+    pub device: Option<String>,
+    /// 鏡のように動かす（自分が右に傾くと、画面のキャラクターも画面の右に傾く）
+    pub mirror: bool,
+    /// 顔をこの角度（度）まで横に向けると、キャラクターがいっぱいまで横を向く
+    pub yaw_range: f32,
+    /// 上下の角度（度）
+    pub pitch_range: f32,
+    /// 頭の傾きの倍率
+    pub roll_gain: f32,
+    /// 視線を動かす
+    pub gaze: bool,
+    /// 目の開き具合・まばたきを読み取る
+    pub eyes: bool,
+    /// 眉・口の表情を読み取る
+    pub expressions: bool,
+    /// 表情の出やすさ（1 = 標準。大きいほど小さな動きで表情が変わる）
+    pub sensitivity: f32,
+    /// 基準（正面を向いて無表情のときの値）。設定画面で測って保存する
+    pub neutral: Option<serde_json::Value>,
+    /// 表情の大きさ（本人がその表情をしたときの値）。設定画面の「表情を覚えさせる」で測る
+    pub ranges: Option<serde_json::Value>,
+}
+
+impl Default for CameraSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            device: None,
+            mirror: true,
+            yaw_range: 30.0,
+            pitch_range: 20.0,
+            roll_gain: 1.0,
+            gaze: true,
+            eyes: true,
+            expressions: true,
+            sensitivity: 1.0,
+            neutral: None,
+            ranges: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ServerSettings {
@@ -84,6 +138,8 @@ impl Default for Settings {
             audio: AudioSettings::default(),
             avatar: AvatarSettings::default(),
             display: DisplaySettings::default(),
+            camera: CameraSettings::default(),
+            hotkeys: BTreeMap::new(),
             server: ServerSettings::default(),
         }
     }
@@ -195,12 +251,21 @@ impl Settings {
         v.sleep_secs = v.sleep_secs.clamp(0.0, 86_400.0);
         let d = &mut self.display;
         d.blink_rate = d.blink_rate.clamp(0.2, 5.0);
+        let c = &mut self.camera;
+        c.yaw_range = c.yaw_range.clamp(5.0, 90.0);
+        c.pitch_range = c.pitch_range.clamp(5.0, 90.0);
+        c.roll_gain = c.roll_gain.clamp(0.0, 3.0);
+        c.sensitivity = c.sensitivity.clamp(0.3, 3.0);
+        self.hotkeys
+            .retain(|name, keys| !name.is_empty() && !keys.is_empty() && keys.len() <= 64);
         if self.server.port < 1024 {
             self.server.port = DEFAULT_PORT;
         }
         (before.audio != self.audio
             || before.avatar != self.avatar
             || before.display != self.display
+            || before.camera != self.camera
+            || before.hotkeys != self.hotkeys
             || before.server != self.server)
             .then(|| "設定ファイルに範囲外の値があったため直しました".to_string())
     }
@@ -229,6 +294,21 @@ impl Settings {
         }
         if !(0.2..=5.0).contains(&self.display.blink_rate) {
             return Err("まばたきの頻度は 0.2〜5 倍にしてください".into());
+        }
+        let c = &self.camera;
+        if !(5.0..=90.0).contains(&c.yaw_range) || !(5.0..=90.0).contains(&c.pitch_range) {
+            return Err("顔の向きの角度は 5〜90 度にしてください".into());
+        }
+        if !(0.0..=3.0).contains(&c.roll_gain) || !(0.3..=3.0).contains(&c.sensitivity) {
+            return Err("カメラの倍率が範囲外です".into());
+        }
+        if self.hotkeys.len() > 64
+            || self
+                .hotkeys
+                .iter()
+                .any(|(n, k)| n.is_empty() || k.is_empty() || k.len() > 64)
+        {
+            return Err("キーの割り当てが正しくありません".into());
         }
         if self.server.port < 1024 {
             return Err("ポートは 1024 以上にしてください".into());
@@ -317,6 +397,9 @@ mod tests {
         assert_eq!(s.audio.off_db, AudioSettings::default().off_db);
         assert!(!s.display.blink);
         assert_eq!(s.server.port, DEFAULT_PORT);
+        // カメラの設定がない古いファイルは、カメラを使わない設定になる
+        assert_eq!(s.camera, CameraSettings::default());
+        assert!(!s.camera.enabled && s.camera.mirror);
     }
 
     #[test]

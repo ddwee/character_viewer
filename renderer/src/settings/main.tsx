@@ -6,17 +6,21 @@ import { render } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 
 import { STATE_LABELS } from './api';
+import { Camera } from './pages/Camera';
 import { Home } from './pages/Home';
 import { Images } from './pages/Images';
 import { Maintenance } from './pages/Maintenance';
 import { Mic } from './pages/Mic';
 import { Obs } from './pages/Obs';
+import { Rig } from './pages/Rig';
 import { SettingsProvider, useSettings, useStatus, useToasts } from './store';
 
 const PAGES = [
   { id: 'home', label: 'ホーム', icon: '🏠' },
   { id: 'mic', label: 'マイク', icon: '🎙️' },
   { id: 'images', label: '画像と動き', icon: '🖼️' },
+  { id: 'rig', label: 'パーツの調整', icon: '🦴' },
+  { id: 'camera', label: 'カメラ', icon: '📷' },
   { id: 'obs', label: 'OBS', icon: '📺' },
   { id: 'maintenance', label: 'メンテナンス', icon: '🛠️' },
 ] as const;
@@ -76,6 +80,8 @@ function App() {
         {page === 'home' && <Home status={status} go={go} />}
         {page === 'mic' && <Mic status={status} />}
         {page === 'images' && <Images />}
+        {page === 'rig' && <Rig />}
+        {page === 'camera' && <Camera />}
         {page === 'obs' && <Obs />}
         {page === 'maintenance' && <Maintenance />}
       </main>

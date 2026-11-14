@@ -7,9 +7,10 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
-    "test": "node --test src/*.test.ts"
+    "test": "node --test \"src/**/*.test.ts\""
   },
   "dependencies": {
+    "@mediapipe/tasks-vision": "^1.2.2",
     "pixi.js": "^8.22.0",
     "preact": "^11.2.0"
   },

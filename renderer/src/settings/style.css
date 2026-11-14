@@ -607,6 +607,13 @@ select {
   flex-wrap: wrap;
   margin-top: 8px;
 }
+.preview-save {
+  margin-left: auto;
+}
+.preview-saved {
+  margin: 6px 0 0;
+  overflow-wrap: anywhere;
+}
 
 .state-grid {
   display: grid;
@@ -981,4 +988,231 @@ select {
   to {
     transform: rotate(360deg);
   }
+}
+
+/* ───── パーツの調整 ───── */
+
+.rig-editor {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  gap: 18px;
+}
+@media (max-width: 900px) {
+  .rig-editor {
+    grid-template-columns: 1fr;
+  }
+}
+.rig-canvas-wrap,
+.rig-loading {
+  width: 100%;
+  height: min(62vh, 560px);
+  min-height: 320px;
+  display: block;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  touch-action: none;
+}
+.rig-loading {
+  display: grid;
+  place-items: center;
+}
+.rig-canvas-wrap {
+  position: relative;
+  overflow: hidden;
+}
+.rig-gl,
+.rig-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+.rig-overlay {
+  touch-action: none;
+}
+.rig-modes {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  overflow: hidden;
+}
+.seg button {
+  font: inherit;
+  font-size: 13.5px;
+  padding: 5px 14px;
+  border: none;
+  background: var(--card);
+  color: var(--text);
+  cursor: pointer;
+}
+.seg button.on {
+  background: var(--accent);
+  color: #fff;
+}
+.rig-side {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  min-width: 0;
+}
+.bone-list {
+  display: grid;
+  gap: 4px;
+}
+.bone {
+  font: inherit;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--card);
+  color: var(--text);
+  cursor: pointer;
+}
+.bone:hover {
+  border-color: var(--accent);
+}
+.bone.on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  font-weight: 600;
+}
+.bone .tag {
+  font-size: 11.5px;
+  font-weight: 400;
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.bone .muted {
+  margin-left: auto;
+  font-weight: 400;
+}
+.bone-detail {
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+}
+.bone-detail h3 {
+  margin: 0 0 8px;
+  font-size: 15px;
+}
+/* 横幅が狭いので、ラベルとつまみを縦に並べる */
+.bone-detail .row {
+  grid-template-columns: 1fr;
+  gap: 4px;
+}
+.pivot-inputs {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.pivot-inputs input {
+  width: 72px;
+  font: inherit;
+  padding: 3px 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--card);
+  color: var(--text);
+}
+
+/* パーツの調整: 奥行き、表情を試す */
+.depth-label {
+  margin-top: 14px;
+}
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.chip {
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.chip.on {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+/* カメラ: 今の値、表情の切り替え */
+.face-values {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 6px 12px;
+  align-items: center;
+  font-size: 12px;
+}
+.face-bar {
+  position: relative;
+  height: 8px;
+  border-radius: 4px;
+  background: var(--accent-soft);
+  overflow: hidden;
+}
+.face-bar.signed::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--line);
+}
+.face-bar-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: var(--accent);
+}
+.face-pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+.face-slots {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 12px 0 0;
+}
+.expr-list {
+  display: grid;
+  gap: 8px;
+}
+.expr-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.expr-row .chip {
+  min-width: 96px;
+}
+.face-slots .tag {
+  font-size: 11.5px;
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: var(--accent-soft);
+  color: var(--accent);
 }

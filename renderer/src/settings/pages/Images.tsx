@@ -114,6 +114,12 @@ export function Images() {
         }
       >
         {view?.error && <Notice kind="error">{view.error}</Notice>}
+        {view?.rig && (
+          <Notice>
+            この素材フォルダは<b>パーツを重ねてボーンで動かす</b>設定（avatar.json の rig）になっています。下の状態ごとの絵は使われません。
+            パーツの画像を上書き保存すると自動で読み込み直します。回転の中心や動きの強さは<a href="#rig">パーツの調整</a>のページで変えられます。
+          </Notice>
+        )}
         <div class="state-grid">
           {view?.states.map((st) => (
             <div class="state-card" key={st.state}>

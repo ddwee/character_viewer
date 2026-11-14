@@ -103,6 +103,8 @@ pub struct AvatarView {
     pub dir: PathBuf,
     pub exists: bool,
     pub states: Vec<StateView>,
+    /// avatar.json に `rig`（パーツを重ねてボーンで動かす設定）がある。あれば状態ごとの絵は使わない
+    pub rig: bool,
     pub error: Option<String>,
 }
 
@@ -161,8 +163,28 @@ pub fn view(dir: &Path) -> AvatarView {
         dir: dir.to_path_buf(),
         exists: dir.is_dir(),
         states,
+        rig: m.other.get("rig").is_some_and(Value::is_object),
         error,
     }
+}
+
+/// avatar.json の `rig`（なければ None）
+pub fn get_rig(dir: &Path) -> Result<Option<Value>, String> {
+    Ok(load(dir)?.other.get("rig").cloned())
+}
+
+/// avatar.json の `rig` を置き換える（ほかの項目はそのまま残す）。
+/// 中身の検査は描画ページ側（rig/manifest.ts）で行う。ここでは形だけ確かめる
+pub fn set_rig(dir: &Path, rig: Value) -> Result<(), String> {
+    if !rig.is_object() {
+        return Err("rig の書き方が正しくありません".into());
+    }
+    if !dir.join("avatar.json").is_file() {
+        return Err("素材フォルダに avatar.json がありません".into());
+    }
+    let mut m = load(dir)?;
+    m.other.insert("rig".into(), rig);
+    save(dir, &m)
 }
 
 fn check(state: &str, slot: &str) -> Result<(), String> {
@@ -333,9 +355,35 @@ mod tests {
         let v: Value =
             serde_json::from_str(&std::fs::read_to_string(d.join("avatar.json")).unwrap()).unwrap();
         assert_eq!(v["future"], true);
+        assert!(!view(&d).rig);
         assert_eq!(v["states"]["talk"]["layer"], 3);
         assert_eq!(v["states"]["talk"]["blink"]["closed"], "talk_closed.png");
         assert!(set_slot(&d, "talk", "image", "evil.exe", b"x").is_err());
         assert!(set_slot(&d, "../x", "image", "a.png", b"x").is_err());
+    }
+
+    #[test]
+    fn detects_rig_and_keeps_it_when_slots_change() {
+        let d = tmp("rig");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("avatar.json"),
+            r#"{"rig":{"layers":[{"bone":"head","image":"parts/face.png"}]}}"#,
+        )
+        .unwrap();
+        assert!(view(&d).rig);
+        set_slot(&d, "idle", "image", "a.png", b"x").unwrap();
+        let mut rig = get_rig(&d).unwrap().unwrap();
+        rig["bones"] = serde_json::json!({ "head": { "pivot": [1, 2] } });
+        set_rig(&d, rig).unwrap();
+        assert!(set_rig(&d, Value::Null).is_err());
+        assert_eq!(
+            get_rig(&d).unwrap().unwrap()["bones"]["head"]["pivot"][1],
+            2
+        );
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(d.join("avatar.json")).unwrap()).unwrap();
+        assert_eq!(v["rig"]["layers"][0]["image"], "parts/face.png");
+        assert_eq!(v["states"]["idle"], "idle.png");
     }
 }

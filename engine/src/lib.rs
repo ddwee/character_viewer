@@ -18,3 +18,4 @@ pub mod runtime;
 pub mod server;
 pub mod service;
 pub mod settings;
+pub mod snapshot;

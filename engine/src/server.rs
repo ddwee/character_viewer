@@ -13,12 +13,14 @@
 //! - `{"type":"hello","version":1}`                         接続直後に 1 回
 //! - `{"type":"state","state":"talk","seq":12}`             状態（idle / talk / away / sleep）。接続直後にも現在の状態を送る
 //! - `{"type":"config","blink":true,"blinkRate":1,"mirror":false}`  見た目の設定。接続直後と変更時
-//! - `{"type":"reload"}`                                    イラスト素材が変わったので読み込み直す
+//! - `{"type":"reload","images":true}`                      イラスト素材が変わったので読み込み直す。
+//!   `images` が false なら変わったのは avatar.json だけ（画像は今のものを使い回せる）
 //! - `{"type":"meter","db":-41.2,"voicing":0.93,"voiced":true}`  音量など（subscribe した側だけ、約 30 回/秒）
+//! - `{"type":"level","db":-31.5}`                          音量だけ（subscribe した側だけ、音声の処理単位ごと＝約 100 回/秒）。口の開き具合用
 //!
 //! 表示側 → エンジン
 //! - `{"type":"ack","seq":12}`             その状態を描画したフレームで返す（遅延の測定用）
-//! - `{"type":"subscribe","meter":true}`   音量などを受け取る
+//! - `{"type":"subscribe","meter":true,"level":true}`   音量などを受け取る（`level` は省略可）
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -73,28 +75,62 @@ pub enum ClientEvent {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum Outgoing {
-    Hello { version: u32 },
+    Hello {
+        version: u32,
+    },
     State(StateMsg),
     Config(DisplaySettings),
-    Reload,
+    Reload {
+        images: bool,
+    },
     Meter(MeterMsg),
+    Level {
+        db: f32,
+    },
+    /// 手動で選んだ表情（rig.expressions の名前。None で解除）
+    Expression {
+        name: Option<String>,
+    },
 }
+
+/// カメラで読み取った顔（tracker ページから届いた JSON をそのまま表示側へ流す）の大きさの上限
+const MAX_FACE_BYTES: usize = 2048;
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum Incoming {
-    Ack { seq: u64 },
-    Subscribe { meter: bool },
+    Ack {
+        seq: u64,
+    },
+    Subscribe {
+        #[serde(default)]
+        meter: bool,
+        #[serde(default)]
+        level: bool,
+        /// カメラで読み取った顔（パーツで動かす素材のときだけ要る）
+        #[serde(default)]
+        face: bool,
+    },
 }
 
 /// 制御スレッド・設定 API とサーバーの橋渡し
 pub struct Hub {
     state: watch::Sender<StateMsg>,
     meter: watch::Sender<MeterMsg>,
+    /// 音量エンベロープ（dB）。音声の処理単位ごとに更新する
+    level: watch::Sender<f32>,
     config: watch::Sender<DisplaySettings>,
-    reload: watch::Sender<u64>,
+    /// 読み込み直しの通し番号（何でも / 画像も読み直すもの）。
+    /// watch は最新の値しか届かないので、画像の読み直しは別の番号で数えて取りこぼさないようにする
+    reload: watch::Sender<(u64, u64)>,
+    /// カメラで読み取った顔（tracker ページが送ってきた JSON のまま。約 30 回/秒）
+    face: watch::Sender<Arc<str>>,
+    /// 手動で選んだ表情
+    expression: watch::Sender<Option<String>>,
     seq: AtomicU64,
     clients: AtomicUsize,
+    /// 接続中の tracker ページ（カメラの読み取り）の数
+    trackers: AtomicUsize,
     events: mpsc::Sender<ClientEvent>,
     /// イラスト素材のフォルダ（実行中に切り替えられる）
     avatar_dir: RwLock<PathBuf>,
@@ -112,10 +148,14 @@ impl Hub {
                 seq: 0,
             }),
             meter: watch::Sender::new(MeterMsg::default()),
+            level: watch::Sender::new(-120.0),
             config: watch::Sender::new(display),
-            reload: watch::Sender::new(0),
+            reload: watch::Sender::new((0, 0)),
+            face: watch::Sender::new(Arc::from("")),
+            expression: watch::Sender::new(None),
             seq: AtomicU64::new(0),
             clients: AtomicUsize::new(0),
+            trackers: AtomicUsize::new(0),
             events,
             avatar_dir: RwLock::new(avatar_dir),
         });
@@ -137,6 +177,11 @@ impl Hub {
         self.meter.send_replace(meter);
     }
 
+    /// 音量（dB）を通知する。口の開き具合に使うので、届いたらすぐ送る
+    pub fn publish_level(&self, db: f32) {
+        self.level.send_replace(db);
+    }
+
     pub fn publish_config(&self, display: DisplaySettings) {
         self.config.send_if_modified(|c| {
             let changed = *c != display;
@@ -147,7 +192,15 @@ impl Hub {
 
     /// イラスト素材を読み込み直させる
     pub fn reload_avatar(&self) {
-        self.reload.send_modify(|n| *n += 1);
+        self.reload.send_modify(|(n, images)| {
+            *n += 1;
+            *images += 1;
+        });
+    }
+
+    /// avatar.json だけが変わった（画像はそのまま）ことを知らせる
+    pub fn reload_manifest(&self) {
+        self.reload.send_modify(|(n, _)| *n += 1);
     }
 
     pub fn avatar_dir(&self) -> PathBuf {
@@ -164,6 +217,24 @@ impl Hub {
             drop(cur);
             self.reload_avatar();
         }
+    }
+
+    /// 手動で表情を選ぶ（None で解除）
+    pub fn publish_expression(&self, name: Option<String>) {
+        self.expression.send_if_modified(|cur| {
+            let changed = *cur != name;
+            *cur = name;
+            changed
+        });
+    }
+
+    pub fn expression(&self) -> Option<String> {
+        self.expression.borrow().clone()
+    }
+
+    /// 接続中の tracker ページ（カメラの読み取り）の数
+    pub fn trackers(&self) -> usize {
+        self.trackers.load(Ordering::Relaxed)
     }
 
     /// 接続中の表示側の数
@@ -253,8 +324,42 @@ async fn ws_handler(
     Query(q): Query<WsQuery>,
     State(hub): State<Arc<Hub>>,
 ) -> Response {
-    let monitor = q.role.as_deref() == Some("monitor");
-    ws.on_upgrade(move |socket| client(socket, hub, monitor))
+    let role = match q.role.as_deref() {
+        Some("monitor") => Role::Monitor,
+        Some("tracker") => Role::Tracker,
+        _ => Role::Display,
+    };
+    ws.on_upgrade(move |socket| client(socket, hub, role))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// OBS などの表示
+    Display,
+    /// 設定画面のプレビューなど（表示側として数えない）
+    Monitor,
+    /// カメラの読み取り（顔の値を送ってくる）
+    Tracker,
+}
+
+struct TrackerCount<'a>(&'a Hub);
+
+impl<'a> TrackerCount<'a> {
+    fn enter(hub: &'a Hub) -> Self {
+        hub.trackers.fetch_add(1, Ordering::Relaxed);
+        Self(hub)
+    }
+}
+
+impl Drop for TrackerCount<'_> {
+    fn drop(&mut self) {
+        self.0.trackers.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// tracker ページから届いた顔の値か（形だけ確かめる。中身は表示側が検査する）
+fn is_face_message(text: &str) -> bool {
+    text.len() <= MAX_FACE_BYTES && text.starts_with(r#"{"type":"face""#) && text.ends_with('}')
 }
 
 struct ClientCount<'a>(&'a Hub);
@@ -279,17 +384,24 @@ async fn send(socket: &mut WebSocket, msg: &Outgoing) -> bool {
     socket.send(Message::text(text)).await.is_ok()
 }
 
-async fn client(mut socket: WebSocket, hub: Arc<Hub>, monitor: bool) {
+async fn client(mut socket: WebSocket, hub: Arc<Hub>, role: Role) {
+    let monitor = role != Role::Display;
     let _count = (!monitor).then(|| ClientCount::enter(&hub));
+    let _tracker = (role == Role::Tracker).then(|| TrackerCount::enter(&hub));
+    let mut face_rx = hub.face.subscribe();
+    let mut expression_rx = hub.expression.subscribe();
+    let mut want_face = false;
     let mut state_rx = hub.state.subscribe();
     let mut meter_rx = hub.meter.subscribe();
+    let mut level_rx = hub.level.subscribe();
     let mut config_rx = hub.config.subscribe();
     let mut reload_rx = hub.reload.subscribe();
     let mut want_meter = false;
+    let mut want_level = false;
 
     let current = *state_rx.borrow_and_update();
     let config = *config_rx.borrow_and_update();
-    reload_rx.borrow_and_update();
+    let mut images_seen = reload_rx.borrow_and_update().1;
     if !send(
         &mut socket,
         &Outgoing::Hello {
@@ -299,6 +411,11 @@ async fn client(mut socket: WebSocket, hub: Arc<Hub>, monitor: bool) {
     .await
         || !send(&mut socket, &Outgoing::Config(config)).await
         || !send(&mut socket, &Outgoing::State(current)).await
+    {
+        return;
+    }
+    let expression = expression_rx.borrow_and_update().clone();
+    if expression.is_some() && !send(&mut socket, &Outgoing::Expression { name: expression }).await
     {
         return;
     }
@@ -313,11 +430,25 @@ async fn client(mut socket: WebSocket, hub: Arc<Hub>, monitor: bool) {
             },
             incoming = socket.recv() => {
                 match incoming {
+                    Some(Ok(Message::Text(text))) if role == Role::Tracker && is_face_message(&text) => {
+                        hub.face.send_replace(Arc::from(text.as_str()));
+                    }
                     Some(Ok(Message::Text(text))) => match serde_json::from_str::<Incoming>(&text) {
                         Ok(Incoming::Ack { seq }) if !monitor => {
                             let _ = hub.events.send(ClientEvent::Ack { seq, at: Instant::now() });
                         }
-                        Ok(Incoming::Subscribe { meter }) => want_meter = meter,
+                        Ok(Incoming::Subscribe { meter, level, face }) => {
+                            want_meter = meter;
+                            if level && !want_level {
+                                // 購読前の古い値は送らない
+                                level_rx.borrow_and_update();
+                            }
+                            want_level = level;
+                            if face && !want_face {
+                                face_rx.borrow_and_update();
+                            }
+                            want_face = face;
+                        }
                         _ => {}
                     },
                     Some(Ok(Message::Close(_)) | Err(_)) | None => break,
@@ -331,9 +462,30 @@ async fn client(mut socket: WebSocket, hub: Arc<Hub>, monitor: bool) {
             },
             changed = reload_rx.changed() => match changed {
                 Ok(()) => {
-                    reload_rx.borrow_and_update();
-                    Outgoing::Reload
+                    let images = reload_rx.borrow_and_update().1;
+                    let msg = Outgoing::Reload { images: images != images_seen };
+                    images_seen = images;
+                    msg
                 }
+                Err(_) => break,
+            },
+            changed = expression_rx.changed() => match changed {
+                Ok(()) => Outgoing::Expression { name: expression_rx.borrow_and_update().clone() },
+                Err(_) => break,
+            },
+            // 顔の値は届いた JSON のまま流す（作り直さない）
+            changed = face_rx.changed(), if want_face => match changed {
+                Ok(()) => {
+                    let text = face_rx.borrow_and_update().clone();
+                    if socket.send(Message::text(&*text)).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                Err(_) => break,
+            },
+            changed = level_rx.changed(), if want_level => match changed {
+                Ok(()) => Outgoing::Level { db: *level_rx.borrow_and_update() },
                 Err(_) => break,
             },
             changed = meter_rx.changed(), if want_meter => match changed {
@@ -344,5 +496,73 @@ async fn client(mut socket: WebSocket, hub: Arc<Hub>, monitor: bool) {
         if !send(&mut socket, &msg).await {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subscribe_accepts_old_and_new_forms() {
+        // 古い描画ページは level を送らない
+        let m: Incoming = serde_json::from_str(r#"{"type":"subscribe","meter":true}"#).unwrap();
+        assert!(matches!(
+            m,
+            Incoming::Subscribe {
+                meter: true,
+                level: false,
+                face: false
+            }
+        ));
+        let m: Incoming = serde_json::from_str(r#"{"type":"subscribe","level":true}"#).unwrap();
+        assert!(matches!(
+            m,
+            Incoming::Subscribe {
+                meter: false,
+                level: true,
+                face: false
+            }
+        ));
+    }
+
+    #[test]
+    fn face_and_expression_messages() {
+        assert!(is_face_message(r#"{"type":"face","ok":true,"yaw":0.1}"#));
+        assert!(!is_face_message(r#"{"type":"ack","seq":1}"#));
+        assert!(!is_face_message(&format!(
+            r#"{{"type":"face","x":"{}"}}"#,
+            "a".repeat(MAX_FACE_BYTES)
+        )));
+        let text = serde_json::to_string(&Outgoing::Expression {
+            name: Some("smile".into()),
+        })
+        .unwrap();
+        assert_eq!(text, r#"{"type":"expression","name":"smile"}"#);
+        let (hub, _rx) = Hub::new(DisplaySettings::default(), PathBuf::new());
+        hub.publish_expression(Some("smile".into()));
+        assert_eq!(hub.expression().as_deref(), Some("smile"));
+        hub.publish_expression(None);
+        assert_eq!(hub.expression(), None);
+    }
+
+    #[test]
+    fn manifest_reload_does_not_count_as_image_reload() {
+        let (hub, _rx) = Hub::new(DisplaySettings::default(), PathBuf::new());
+        let rx = hub.reload.subscribe();
+        hub.reload_avatar();
+        hub.reload_manifest();
+        // 画像の読み直しの後に avatar.json だけの通知が来ても、画像の読み直しは取りこぼさない
+        assert_eq!(*rx.borrow(), (2, 1));
+        hub.reload_manifest();
+        assert_eq!(*rx.borrow(), (3, 1));
+        let text = serde_json::to_string(&Outgoing::Reload { images: false }).unwrap();
+        assert_eq!(text, r#"{"type":"reload","images":false}"#);
+    }
+
+    #[test]
+    fn level_message_shape() {
+        let text = serde_json::to_string(&Outgoing::Level { db: -31.5 }).unwrap();
+        assert_eq!(text, r#"{"type":"level","db":-31.5}"#);
     }
 }
