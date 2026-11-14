@@ -1,7 +1,7 @@
 [package]
 name = "cv-engine"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 
 [dependencies]
 anyhow = "1.0.104"
@@ -10,12 +10,14 @@ clap = { version = "4.6.7", features = ["derive"] }
 cpal = "0.18.2"
 ctrlc = "3.5.2"
 hound = "3.5.1"
+log = "0.4.35"
 rtrb = "0.4.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tokio = { version = "1.54.1", features = ["rt", "net", "sync", "time", "macros"] }
+tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.7.1", features = ["fs", "set-header"] }
-windows-sys = { version = "0.61.2", features = ["Win32_System_Performance"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Performance", "Win32_System_SystemInformation"] }
 
 [dev-dependencies]
 windows = { version = "0.62", features = ["Win32_Media_Audio", "Win32_System_Com"] }

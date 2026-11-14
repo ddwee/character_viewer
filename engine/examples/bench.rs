@@ -9,11 +9,16 @@ use cv_engine::pipeline::{Pipeline, PipelineConfig};
 use cv_engine::pitch::VoicingConfig;
 
 fn main() -> anyhow::Result<()> {
-    let path = std::env::args().nth(1).unwrap_or_else(|| "calibration.wav".into());
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "calibration.wav".into());
     let mut r = hound::WavReader::open(&path)?;
     let spec = r.spec();
     let sr = spec.sample_rate as f32;
-    let samples: Vec<f32> = r.samples::<f32>().step_by(spec.channels as usize).collect::<Result<_, _>>()?;
+    let samples: Vec<f32> = r
+        .samples::<f32>()
+        .step_by(spec.channels as usize)
+        .collect::<Result<_, _>>()?;
     let secs = samples.len() as f64 / sr as f64;
 
     let configs = [
@@ -23,9 +28,17 @@ fn main() -> anyhow::Result<()> {
     ];
     for (name, on_db, voicing) in configs {
         let cfg = PipelineConfig {
-            detector: DetectorConfig { on_db, off_db: on_db - 8.0, ..Default::default() },
+            detector: DetectorConfig {
+                on_db,
+                off_db: on_db - 8.0,
+                ..Default::default()
+            },
             hpf_hz: 80.0,
-            voicing: voicing.map(|enter| VoicingConfig { enter, exit: enter - 0.15, ..Default::default() }),
+            voicing: voicing.map(|enter| VoicingConfig {
+                enter,
+                exit: enter - 0.15,
+                ..Default::default()
+            }),
         };
         let mut best = f64::MAX;
         for _ in 0..5 {

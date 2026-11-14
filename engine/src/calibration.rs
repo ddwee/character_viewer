@@ -21,7 +21,13 @@ pub struct Segment {
 
 /// 録音手順。区間の切り替え直後は動作が追いつかないため SETTLE_SECS だけ集計から除く
 pub const SEGMENTS: &[Segment] = &[
-    Segment { key: "silence", label: "無音", prompt: "何もせず、静かにしていてください", secs: 6.0, is_speech: false },
+    Segment {
+        key: "silence",
+        label: "無音",
+        prompt: "何もせず、静かにしていてください",
+        secs: 6.0,
+        is_speech: false,
+    },
     Segment {
         key: "breath",
         label: "呼吸",
@@ -29,9 +35,27 @@ pub const SEGMENTS: &[Segment] = &[
         secs: 8.0,
         is_speech: false,
     },
-    Segment { key: "typing", label: "タイプ音", prompt: "キーボードを普段どおりタイプしてください", secs: 8.0, is_speech: false },
-    Segment { key: "quiet", label: "小声", prompt: "小声で話してください（独り言くらいの声）", secs: 8.0, is_speech: true },
-    Segment { key: "normal", label: "普段の声", prompt: "配信のときの普段の声で話してください", secs: 8.0, is_speech: true },
+    Segment {
+        key: "typing",
+        label: "タイプ音",
+        prompt: "キーボードを普段どおりタイプしてください",
+        secs: 8.0,
+        is_speech: false,
+    },
+    Segment {
+        key: "quiet",
+        label: "小声",
+        prompt: "小声で話してください（独り言くらいの声）",
+        secs: 8.0,
+        is_speech: true,
+    },
+    Segment {
+        key: "normal",
+        label: "普段の声",
+        prompt: "配信のときの普段の声で話してください",
+        secs: 8.0,
+        is_speech: true,
+    },
 ];
 pub const SETTLE_SECS: f32 = 1.0;
 const TAIL_SECS: f32 = 0.3;
@@ -59,7 +83,10 @@ pub fn total_secs() -> f32 {
 fn segment_range(i: usize, sr: f32) -> (usize, usize) {
     let start: f32 = SEGMENTS[..i].iter().map(|s| s.secs).sum();
     let end = start + SEGMENTS[i].secs;
-    (((start + SETTLE_SECS) * sr) as usize, ((end - TAIL_SECS) * sr) as usize)
+    (
+        ((start + SETTLE_SECS) * sr) as usize,
+        ((end - TAIL_SECS) * sr) as usize,
+    )
 }
 
 fn percentile(sorted: &[f32], p: f32) -> Option<f32> {
@@ -133,7 +160,11 @@ pub struct Report {
 }
 
 /// 基準設定で 1 回通して、区間ごとの統計と「はっきり声」の瞬間（2.5ms 単位）を求める
-fn collect_stats(samples: &[f32], sr: f32, base: &PipelineConfig) -> (Vec<SegmentStats>, Vec<bool>) {
+fn collect_stats(
+    samples: &[f32],
+    sr: f32,
+    base: &PipelineConfig,
+) -> (Vec<SegmentStats>, Vec<bool>) {
     let hop = (sr / HOPS_PER_SEC) as usize;
     let mut p = Pipeline::new(base, sr);
     // (サンプル番号, 音量 dB, 有声, 声らしさ)
@@ -155,8 +186,18 @@ fn collect_stats(samples: &[f32], sr: f32, base: &PipelineConfig) -> (Vec<Segmen
             let mut voiced_env_db: Vec<f32> = in_seg.iter().filter(|f| f.2).map(|f| f.1).collect();
             env_db.sort_by(f32::total_cmp);
             voiced_env_db.sort_by(f32::total_cmp);
-            let voiced_ratio = if in_seg.is_empty() { 0.0 } else { voiced_env_db.len() as f32 / in_seg.len() as f32 };
-            SegmentStats { label: seg.label, key: seg.key, env_db, voiced_env_db, voiced_ratio }
+            let voiced_ratio = if in_seg.is_empty() {
+                0.0
+            } else {
+                voiced_env_db.len() as f32 / in_seg.len() as f32
+            };
+            SegmentStats {
+                label: seg.label,
+                key: seg.key,
+                env_db,
+                voiced_env_db,
+                voiced_ratio,
+            }
         })
         .collect();
 
@@ -169,7 +210,11 @@ fn collect_stats(samples: &[f32], sr: f32, base: &PipelineConfig) -> (Vec<Segmen
 }
 
 fn silence_top(stats: &[SegmentStats]) -> f32 {
-    stats.iter().find(|s| s.key == "silence").and_then(|s| s.env(0.99)).unwrap_or(-70.0)
+    stats
+        .iter()
+        .find(|s| s.key == "silence")
+        .and_then(|s| s.env(0.99))
+        .unwrap_or(-70.0)
 }
 
 fn simulate(samples: &[f32], sr: f32, cfg: &PipelineConfig, clear: &[bool]) -> Vec<SegmentResult> {
@@ -201,11 +246,13 @@ fn simulate(samples: &[f32], sr: f32, cfg: &PipelineConfig, clear: &[bool]) -> V
     acc.iter()
         .zip(&ranges)
         .zip(SEGMENTS)
-        .map(|((&(starts, speaking, clear_n, clear_hit), &(a, b)), seg)| SegmentResult {
-            starts,
-            speaking: speaking as f32 / (b - a).max(1) as f32,
-            recall: (seg.is_speech && clear_n >= 20).then(|| clear_hit as f32 / clear_n as f32),
-        })
+        .map(
+            |((&(starts, speaking, clear_n, clear_hit), &(a, b)), seg)| SegmentResult {
+                starts,
+                speaking: speaking as f32 / (b - a).max(1) as f32,
+                recall: (seg.is_speech && clear_n >= 20).then(|| clear_hit as f32 / clear_n as f32),
+            },
+        )
         .collect()
 }
 
@@ -238,7 +285,11 @@ impl Trial {
     }
 
     fn recall(&self, key: &str) -> f32 {
-        self.segments().find(|(s, _)| s.key == key).and_then(|(_, r)| r.recall).unwrap_or(0.0) * 100.0
+        self.segments()
+            .find(|(s, _)| s.key == key)
+            .and_then(|(_, r)| r.recall)
+            .unwrap_or(0.0)
+            * 100.0
     }
 
     /// 小さいほど良い
@@ -263,29 +314,54 @@ fn on_grid() -> impl Iterator<Item = f32> {
 }
 
 /// 候補の設定をすべて実際に判定へ通す（CPU コア数に合わせて並列実行）
-fn run_trials(samples: &[f32], sr: f32, base: &PipelineConfig, clear: &[bool], silence_top: f32) -> Vec<Trial> {
+fn run_trials(
+    samples: &[f32],
+    sr: f32,
+    base: &PipelineConfig,
+    clear: &[bool],
+    silence_top: f32,
+) -> Vec<Trial> {
     let combos: Vec<(f32, f32)> = match base.voicing {
-        Some(_) => ENTER_GRID.iter().flat_map(|&e| on_grid().map(move |on| (e, on))).collect(),
+        Some(_) => ENTER_GRID
+            .iter()
+            .flat_map(|&e| on_grid().map(move |on| (e, on)))
+            .collect(),
         // 声らしさ判定が無効なら音量しきい値だけを探す
         None => on_grid().map(|on| (f32::NAN, on)).collect(),
     };
     let make = |&(enter, on): &(f32, f32)| {
         let mut cfg = *base;
         if let Some(v) = base.voicing {
-            cfg.voicing = Some(VoicingConfig { enter, exit: (enter - 0.15).max(0.0), ..v });
+            cfg.voicing = Some(VoicingConfig {
+                enter,
+                exit: (enter - 0.15).max(0.0),
+                ..v
+            });
         }
         let on_db = round_db(on);
         cfg.detector.on_db = on_db;
         cfg.detector.off_db = round_db((on_db - 8.0).max(silence_top + 3.0)).min(on_db);
-        Trial { enter, on_db, off_db: cfg.detector.off_db, per_segment: simulate(samples, sr, &cfg, clear) }
+        Trial {
+            enter,
+            on_db,
+            off_db: cfg.detector.off_db,
+            per_segment: simulate(samples, sr, &cfg, clear),
+        }
     };
 
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(combos.len());
+    let threads = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(combos.len());
     let chunk = combos.len().div_ceil(threads);
     std::thread::scope(|scope| {
-        let handles: Vec<_> =
-            combos.chunks(chunk).map(|part| scope.spawn(move || part.iter().map(make).collect::<Vec<_>>())).collect();
-        handles.into_iter().flat_map(|h| h.join().expect("解析スレッドが異常終了しました")).collect()
+        let handles: Vec<_> = combos
+            .chunks(chunk)
+            .map(|part| scope.spawn(move || part.iter().map(make).collect::<Vec<_>>()))
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("解析スレッドが異常終了しました"))
+            .collect()
     })
 }
 
@@ -317,8 +393,15 @@ pub fn analyze(samples: &[f32], sr: f32, base: &PipelineConfig) -> Report {
             per_segment: best.per_segment.clone(),
         }
     };
-    let sims = vec![pick("A: 小声にも反応", true), pick("B: 普段の声だけに反応", false)];
-    Report { stats, sims, base: *base }
+    let sims = vec![
+        pick("A: 小声にも反応", true),
+        pick("B: 普段の声だけに反応", false),
+    ];
+    Report {
+        stats,
+        sims,
+        base: *base,
+    }
 }
 
 fn fmt_db(v: Option<f32>) -> String {
@@ -328,7 +411,11 @@ fn fmt_db(v: Option<f32>) -> String {
 impl fmt::Display for Report {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "── 区間ごとの分析 ──")?;
-        writeln!(f, "{:<8} {:>22}   {:>8}   {:>18}", "区間", "音量 dBFS (中央/90%/99%)", "声らしさ", "声の音量 (20%/80%)")?;
+        writeln!(
+            f,
+            "{:<8} {:>22}   {:>8}   {:>18}",
+            "区間", "音量 dBFS (中央/90%/99%)", "声らしさ", "声の音量 (20%/80%)"
+        )?;
         for s in &self.stats {
             writeln!(
                 f,
@@ -344,9 +431,16 @@ impl fmt::Display for Report {
         }
         writeln!(f)?;
         writeln!(f, "── 推奨設定（実際に判定を通した結果）──")?;
-        writeln!(f, "声の捕捉率 = はっきり声と分かる瞬間のうち、発話中と判定できた割合")?;
+        writeln!(
+            f,
+            "声の捕捉率 = はっきり声と分かる瞬間のうち、発話中と判定できた割合"
+        )?;
         for sim in &self.sims {
-            write!(f, "[{}]  --on-db {} --off-db {}", sim.name, sim.on_db, sim.off_db)?;
+            write!(
+                f,
+                "[{}]  --on-db {} --off-db {}",
+                sim.name, sim.on_db, sim.off_db
+            )?;
             match sim.voicing {
                 Some(v) => writeln!(f, " --voicing {v}")?,
                 None => writeln!(f)?,
@@ -360,7 +454,9 @@ impl fmt::Display for Report {
                     (false, true) => "× 誤反応",
                     (true, false) => "× 無反応",
                 };
-                let recall = r.recall.map_or(String::new(), |v| format!("   声の捕捉率 {:>5.1}%", v * 100.0));
+                let recall = r.recall.map_or(String::new(), |v| {
+                    format!("   声の捕捉率 {:>5.1}%", v * 100.0)
+                });
                 writeln!(
                     f,
                     "    {:<8} 反応 {:>3} 回   発話中 {:>5.1}%{recall}   {verdict}",
@@ -408,7 +504,13 @@ mod tests {
         assert_eq!(report.sims.len(), 2);
         for sim in &report.sims {
             for (seg, r) in SEGMENTS.iter().zip(&sim.per_segment) {
-                assert_eq!(r.reacted(), sim.is_target(seg), "{} / {}: {r:?}", sim.name, seg.label);
+                assert_eq!(
+                    r.reacted(),
+                    sim.is_target(seg),
+                    "{} / {}: {r:?}",
+                    sim.name,
+                    seg.label
+                );
             }
         }
     }

@@ -9,10 +9,11 @@ use serde::Serialize;
 
 use crate::detector::Transition;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AvatarState {
     /// 待機（喋っていない）
+    #[default]
     Idle,
     /// 発話中
     Talk,
@@ -43,7 +44,10 @@ pub struct AvatarConfig {
 
 impl Default for AvatarConfig {
     fn default() -> Self {
-        Self { away_after: Some(Duration::from_secs(6)), sleep_after: Some(Duration::from_secs(12)) }
+        Self {
+            away_after: Some(Duration::from_secs(6)),
+            sleep_after: Some(Duration::from_secs(12)),
+        }
     }
 }
 
@@ -56,11 +60,20 @@ pub struct AvatarMachine {
 
 impl AvatarMachine {
     pub fn new(cfg: AvatarConfig, now: Duration) -> Self {
-        Self { cfg, state: AvatarState::Idle, silent_since: Some(now) }
+        Self {
+            cfg,
+            state: AvatarState::Idle,
+            silent_since: Some(now),
+        }
     }
 
     pub fn state(&self) -> AvatarState {
         self.state
+    }
+
+    /// 放置・寝落ちまでの秒数を変える（次の `tick` から反映）
+    pub fn set_config(&mut self, cfg: AvatarConfig) {
+        self.cfg = cfg;
     }
 
     /// 無音が続いている時間（発話中は None）
@@ -101,7 +114,13 @@ mod tests {
     }
 
     fn machine() -> AvatarMachine {
-        AvatarMachine::new(AvatarConfig { away_after: Some(s(30.0)), sleep_after: Some(s(180.0)) }, s(0.0))
+        AvatarMachine::new(
+            AvatarConfig {
+                away_after: Some(s(30.0)),
+                sleep_after: Some(s(180.0)),
+            },
+            s(0.0),
+        )
     }
 
     #[test]
@@ -119,10 +138,16 @@ mod tests {
         let mut m = machine();
         m.tick(s(200.0));
         assert_eq!(m.state(), AvatarState::Sleep);
-        assert_eq!(m.on_transition(Transition::SpeechStart, s(200.0)), Some(AvatarState::Talk));
+        assert_eq!(
+            m.on_transition(Transition::SpeechStart, s(200.0)),
+            Some(AvatarState::Talk)
+        );
         // 喋っている間は時間が経っても発話のまま
         assert_eq!(m.tick(s(500.0)), None);
-        assert_eq!(m.on_transition(Transition::SpeechEnd, s(500.0)), Some(AvatarState::Idle));
+        assert_eq!(
+            m.on_transition(Transition::SpeechEnd, s(500.0)),
+            Some(AvatarState::Idle)
+        );
         // 無音の時間は発話終了から数え直す
         assert_eq!(m.tick(s(529.0)), None);
         assert_eq!(m.tick(s(530.0)), Some(AvatarState::Away));
@@ -130,14 +155,26 @@ mod tests {
 
     #[test]
     fn disabled_timers_stay_idle() {
-        let mut m = AvatarMachine::new(AvatarConfig { away_after: None, sleep_after: None }, s(0.0));
+        let mut m = AvatarMachine::new(
+            AvatarConfig {
+                away_after: None,
+                sleep_after: None,
+            },
+            s(0.0),
+        );
         assert_eq!(m.tick(s(10_000.0)), None);
         assert_eq!(m.state(), AvatarState::Idle);
     }
 
     #[test]
     fn sleep_without_away() {
-        let mut m = AvatarMachine::new(AvatarConfig { away_after: None, sleep_after: Some(s(60.0)) }, s(0.0));
+        let mut m = AvatarMachine::new(
+            AvatarConfig {
+                away_after: None,
+                sleep_after: Some(s(60.0)),
+            },
+            s(0.0),
+        );
         assert_eq!(m.tick(s(59.0)), None);
         assert_eq!(m.tick(s(60.0)), Some(AvatarState::Sleep));
     }

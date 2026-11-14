@@ -85,10 +85,21 @@ export class BlinkScheduler {
   private current: { start: number; shape: BlinkShape } | null = null;
   private lastEnd = -Infinity;
   private talking = false;
+  /** 頻度の倍率（2 なら間隔が半分） */
+  private rate = 1;
 
   constructor(rng: Rng, now: number) {
     this.rng = rng;
     this.nextAt = now + nextInterval(rng, false);
+  }
+
+  /** 頻度の倍率を変える（設定画面の「まばたきの頻度」） */
+  setRate(rate: number): void {
+    this.rate = Math.min(5, Math.max(0.2, rate || 1));
+  }
+
+  private interval(): number {
+    return nextInterval(this.rng, this.talking) / this.rate;
   }
 
   /** 喋っているかを伝える（瞬きの頻度が変わる） */
@@ -105,7 +116,7 @@ export class BlinkScheduler {
 
   /** 瞬きの予定を今から立て直す（まばたきしない絵から戻ったときなど） */
   reschedule(now: number): void {
-    if (!this.current) this.nextAt = now + nextInterval(this.rng, this.talking);
+    if (!this.current) this.nextAt = now + this.interval();
   }
 
   /** すぐに瞬く（確認用） */
@@ -132,7 +143,7 @@ export class BlinkScheduler {
     this.lastEnd = now;
     this.current = null;
     this.nextAt =
-      this.rng() < BLINK.doubleChance ? now + between(this.rng, BLINK.doubleGapMs) : now + nextInterval(this.rng, this.talking);
+      this.rng() < BLINK.doubleChance ? now + between(this.rng, BLINK.doubleGapMs) : now + this.interval();
     return 'open';
   }
 }

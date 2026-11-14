@@ -9,6 +9,7 @@
 //   ?checker  背景を市松模様にする（ブラウザで透過を確認する用）
 //   ?sync     遅延測定用。発話中は白、それ以外は黒で全体を塗る（cv-engine --measure-av で解析する）
 //   ?engine=127.0.0.1:39540  エンジンの場所（通常は不要）
+//   ?embed    設定画面の中のプレビュー用（エンジンへ描画の応答を返さない）
 
 import { Application, Assets, Sprite, Texture } from 'pixi.js';
 import 'pixi.js/prepare';
@@ -42,9 +43,18 @@ interface Look {
   closed?: Texture;
 }
 
+/** 見た目の設定（設定画面で変える） */
+interface DisplayConfig {
+  blink: boolean;
+  blinkRate: number;
+  mirror: boolean;
+}
+
 type ServerMsg =
   | { type: 'hello'; version: number }
   | { type: 'state'; state: AvatarState; seq: number }
+  | ({ type: 'config' } & DisplayConfig)
+  | { type: 'reload' }
   | { type: 'meter'; db: number; voicing: number; voiced: boolean };
 
 const PROTOCOL_VERSION = 1;
@@ -55,6 +65,7 @@ const DISCONNECT_GRACE_MS = 2000;
 const params = new URLSearchParams(location.search);
 const debug = params.has('debug');
 const syncMode = params.has('sync');
+const embed = params.has('embed');
 if (params.has('checker')) document.body.classList.add('checker');
 
 const app = new Application();
@@ -64,6 +75,9 @@ const blink = new BlinkScheduler(Math.random, performance.now());
 const EMPTY_LOOK: Look = { open: Texture.EMPTY };
 
 let current: AvatarState = 'idle';
+let config: DisplayConfig = { blink: true, blinkRate: 1, mirror: false };
+/** 素材を読み込み直すたびに増やす（ブラウザやPixiJSのキャッシュを避ける） */
+let avatarVersion = 0;
 let eye: Eye = 'open';
 const stats = { changes: 0, reconnects: 0, blinks: 0, renders: 0 };
 
@@ -83,7 +97,8 @@ function layout(): void {
   const tex = sprite.texture;
   if (tex.width === 0 || tex.height === 0) return;
   const { width, height } = app.screen;
-  sprite.scale.set(Math.min(width / tex.width, height / tex.height));
+  const scale = Math.min(width / tex.width, height / tex.height);
+  sprite.scale.set(config.mirror ? -scale : scale, scale);
   sprite.position.set(width / 2, height);
 }
 
@@ -111,7 +126,7 @@ function drawSync(): void {
 
 function drawAvatar(now: number, look: Look): void {
   const prevEye = eye;
-  eye = look.closed ? blink.update(now, look.half !== undefined) : 'open';
+  eye = look.closed && config.blink ? blink.update(now, look.half !== undefined) : 'open';
   if (prevEye === 'open' && eye !== 'open') stats.blinks++;
 
   const tex = (eye === 'closed' && look.closed) || (eye === 'half' && (look.half ?? look.closed)) || look.open;
@@ -135,7 +150,7 @@ function frame(now: number): void {
 
   // 次に描くべき時刻まで眠る（まばたき中は毎フレーム描く）
   clearTimeout(wakeTimer);
-  if (!syncMode && look.closed) {
+  if (!syncMode && look.closed && config.blink) {
     const wakeAt = blink.wakeAt();
     if (wakeAt <= now) requestFrame();
     else wakeTimer = setTimeout(requestFrame, wakeAt - now);
@@ -160,7 +175,7 @@ function show(state: AvatarState): void {
 }
 
 async function loadTexture(file: string): Promise<Texture> {
-  const tex = await Assets.load<Texture>(`avatar/${file}`);
+  const tex = await Assets.load<Texture>({ src: `avatar/${file}?v=${avatarVersion}`, alias: `${file}?v=${avatarVersion}` });
   // 縮小表示でも荒れないように（素材は表示サイズより大きく描く前提）
   tex.source.autoGenerateMipmaps = true;
   tex.source.scaleMode = 'linear';
@@ -177,29 +192,67 @@ async function loadLook(entry: StateEntry): Promise<Look> {
   return { open, half, closed };
 }
 
+/**
+ * 素材を読み込む。読み込み直しのときは、新しい絵がすべて揃ってから入れ替える
+ * （途中で失敗したら今の絵のまま）
+ */
 async function loadAvatar(): Promise<void> {
-  const res = await fetch('avatar/avatar.json', { cache: 'no-store' });
+  avatarVersion++;
+  const res = await fetch(`avatar/avatar.json?v=${avatarVersion}`, { cache: 'no-store' });
   if (!res.ok) throw new Error(`avatar/avatar.json を読み込めません（${res.status}）`);
   const manifest = (await res.json()) as Manifest;
 
+  const next = new Map<AvatarState, Look>();
   await Promise.all(
     STATES.map(async (state) => {
       const entry = manifest.states?.[state];
-      if (entry) looks.set(state, await loadLook(entry));
+      if (entry) next.set(state, await loadLook(entry));
     }),
   );
-  if (!looks.has('idle')) throw new Error('avatar.json に idle（待機）の画像がありません');
+  if (!next.has('idle')) throw new Error('待機の絵が設定されていません（設定画面の「画像」で設定してください）');
 
   // 切り替えた瞬間にカクつかないよう、全画像を先に GPU へ送っておく
-  const all = [...looks.values()].flatMap((l) => [l.open, l.half, l.closed]).filter((t): t is Texture => !!t);
-  await app.renderer.prepare.upload(all);
+  const textures = (m: Map<AvatarState, Look>) => [...m.values()].flatMap((l) => [l.open, l.half, l.closed]).filter((t): t is Texture => !!t);
+  await app.renderer.prepare.upload(textures(next));
+
+  const old = textures(looks);
+  looks.clear();
+  for (const [k, v] of next) looks.set(k, v);
+  sprite.texture = Texture.EMPTY;
+  overlay.clearError();
+  requestFrame();
+  // 古い絵を GPU とキャッシュから外す（描き替えたあとで）
+  requestAnimationFrame(() => {
+    for (const t of old) if (!textures(looks).includes(t)) t.destroy(true);
+  });
+}
+
+let reloading: Promise<void> | null = null;
+let reloadAgain = false;
+
+/** 素材が変わったという通知で読み込み直す（連続した通知はまとめる） */
+function reloadAvatar(): void {
+  if (reloading) {
+    reloadAgain = true;
+    return;
+  }
+  reloading = loadAvatar()
+    .catch((e) => overlay.error(e instanceof Error ? e.message : String(e)))
+    .finally(() => {
+      reloading = null;
+      if (reloadAgain) {
+        reloadAgain = false;
+        reloadAvatar();
+      }
+    });
 }
 
 // ───────────────────────── エンジンとの接続 ─────────────────────────
 
 function engineUrl(): string {
   const host = params.get('engine') ?? location.host;
-  return `${location.protocol === 'https:' ? 'wss' : 'ws'}://${host}/ws`;
+  // 設定画面のプレビューは「表示側」として数えない（OBS の接続数に混ざらないように）
+  return `${location.protocol === 'https:' ? 'wss' : 'ws'}://${host}/ws${embed ? '?role=monitor' : ''}`;
 }
 
 let disconnectTimer: ReturnType<typeof setTimeout> | undefined;
@@ -210,7 +263,7 @@ function connect(): void {
 
   ws.onopen = () => {
     clearTimeout(disconnectTimer);
-    sendAck = (seq) => send({ type: 'ack', seq });
+    if (!embed) sendAck = (seq) => send({ type: 'ack', seq });
     overlay.connected(true);
     if (debug) send({ type: 'subscribe', meter: true });
   };
@@ -228,6 +281,18 @@ function connect(): void {
         show(msg.state);
         pendingAcks.push(msg.seq);
         requestFrame();
+        break;
+      case 'config': {
+        const { type: _, ...c } = msg;
+        config = c;
+        blink.setRate(config.blinkRate);
+        blink.reschedule(performance.now());
+        sprite.texture = Texture.EMPTY; // 反転などを反映させるため配置し直す
+        requestFrame();
+        break;
+      }
+      case 'reload':
+        if (!syncMode) reloadAvatar();
         break;
       case 'meter':
         overlay.meter(msg.db, msg.voicing, msg.voiced);
@@ -293,6 +358,10 @@ const overlay = (() => {
       level = `音量 : [${bar}] ${db.toFixed(1)} dB  声らしさ ${voicing.toFixed(2)}${voiced ? ' ♪' : ''}`;
       render();
     },
+    clearError() {
+      errorEl.hidden = true;
+      errorEl.textContent = '';
+    },
     error(message: string) {
       // OBS のプレビューでも気づけるよう、エラーは常に表示する
       errorEl.hidden = false;
@@ -337,6 +406,19 @@ async function main(): Promise<void> {
   overlay.render();
   requestFrame();
   connect();
+
+  // 設定画面のプレビューから、状態やまばたきを試す（この画面の中だけ。OBS の表示には影響しない）
+  if (embed) {
+    window.addEventListener('message', (e: MessageEvent) => {
+      if (e.origin !== location.origin) return;
+      const m = e.data as { type?: string; state?: AvatarState };
+      if (m.type === 'preview-state' && m.state && STATES.includes(m.state)) show(m.state);
+      if (m.type === 'preview-blink') {
+        blink.blinkNow(performance.now());
+        requestFrame();
+      }
+    });
+  }
 }
 
 main();

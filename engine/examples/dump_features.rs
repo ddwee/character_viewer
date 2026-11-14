@@ -9,11 +9,17 @@ use cv_engine::pipeline::{Pipeline, PipelineConfig};
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    anyhow::ensure!(args.len() == 3, "使い方: dump_features <入力.wav> <出力.csv>");
+    anyhow::ensure!(
+        args.len() == 3,
+        "使い方: dump_features <入力.wav> <出力.csv>"
+    );
     let mut r = hound::WavReader::open(&args[1])?;
     let spec = r.spec();
     let sr = spec.sample_rate as f32;
-    let samples: Vec<f32> = r.samples::<f32>().step_by(spec.channels as usize).collect::<Result<_, _>>()?;
+    let samples: Vec<f32> = r
+        .samples::<f32>()
+        .step_by(spec.channels as usize)
+        .collect::<Result<_, _>>()?;
 
     let mut p = Pipeline::new(&PipelineConfig::default(), sr);
     let hop = (sr / 400.0) as usize;

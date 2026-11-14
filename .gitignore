@@ -21,3 +21,11 @@ Desktop.ini
 
 # 録音（声を含むため公開しない）
 *.wav
+
+# インストール先（tools/build.ps1 が作る）
+/bin/
+/bin.prev/
+/bin.new/
+
+# Tauri が自動生成するスキーマ
+/app/gen/

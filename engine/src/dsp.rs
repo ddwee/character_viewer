@@ -14,7 +14,15 @@ pub struct Biquad {
 
 impl Biquad {
     fn normalized(b0: f32, b1: f32, b2: f32, a0: f32, a1: f32, a2: f32) -> Self {
-        Self { b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0, a2: a2 / a0, z1: 0.0, z2: 0.0 }
+        Self {
+            b0: b0 / a0,
+            b1: b1 / a0,
+            b2: b2 / a0,
+            a1: a1 / a0,
+            a2: a2 / a0,
+            z1: 0.0,
+            z2: 0.0,
+        }
     }
 
     fn params(cutoff_hz: f32, sample_rate: f32, q: f32) -> (f32, f32) {
@@ -26,18 +34,40 @@ impl Biquad {
     /// ハイパス。コンデンサーマイクが拾う低域ノイズ（空調・机の振動・ハム）を除く。
     pub fn highpass(cutoff_hz: f32, sample_rate: f32, q: f32) -> Self {
         let (c, alpha) = Self::params(cutoff_hz, sample_rate, q);
-        Self::normalized((1.0 + c) / 2.0, -(1.0 + c), (1.0 + c) / 2.0, 1.0 + alpha, -2.0 * c, 1.0 - alpha)
+        Self::normalized(
+            (1.0 + c) / 2.0,
+            -(1.0 + c),
+            (1.0 + c) / 2.0,
+            1.0 + alpha,
+            -2.0 * c,
+            1.0 - alpha,
+        )
     }
 
     /// ローパス。
     pub fn lowpass(cutoff_hz: f32, sample_rate: f32, q: f32) -> Self {
         let (c, alpha) = Self::params(cutoff_hz, sample_rate, q);
-        Self::normalized((1.0 - c) / 2.0, 1.0 - c, (1.0 - c) / 2.0, 1.0 + alpha, -2.0 * c, 1.0 - alpha)
+        Self::normalized(
+            (1.0 - c) / 2.0,
+            1.0 - c,
+            (1.0 - c) / 2.0,
+            1.0 + alpha,
+            -2.0 * c,
+            1.0 - alpha,
+        )
     }
 
     /// 素通し。
     pub fn identity() -> Self {
-        Self { b0: 1.0, b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0, z1: 0.0, z2: 0.0 }
+        Self {
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+            a1: 0.0,
+            a2: 0.0,
+            z1: 0.0,
+            z2: 0.0,
+        }
     }
 
     #[inline]
@@ -81,7 +111,10 @@ mod tests {
         let sr = 48_000.0;
         let hp = Biquad::highpass(80.0, sr, std::f32::consts::FRAC_1_SQRT_2);
         assert!(steady_peak(hp, 20.0, sr) < 0.1, "20Hz は十分に減衰する");
-        assert!(steady_peak(hp, 1_000.0, sr) > 0.98, "1kHz（声の帯域）は通る");
+        assert!(
+            steady_peak(hp, 1_000.0, sr) > 0.98,
+            "1kHz（声の帯域）は通る"
+        );
     }
 
     #[test]
